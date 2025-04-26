@@ -117,12 +117,15 @@ class MnaAssembler:
         # Reset COO lists
         self._rows, self._cols, self._data = [], [], []
 
+        # Create a 1-element NumPy array for the current frequency
+        current_freq_array = np.array([self.freq_hz])
+
         # 1. Stamp Simulation Components
         sim_components: Dict[str, ComponentBase] = self.circuit.sim_components
         for comp_id, comp in sim_components.items():
             try:
                 # Get admittance (complex Quantity in Siemens)
-                admittance_qty = comp.get_admittance(self.freq_hz)
+                admittance_qty = comp.get_admittance(current_freq_array)[0] # Only one element in ndarray
 
                 # --- Enforce Contract ---
                 if not isinstance(admittance_qty, Quantity):
@@ -157,7 +160,7 @@ class MnaAssembler:
                 n1 = self.node_map[port1_net_name]
                 n2 = self.node_map[port2_net_name]
 
-                logger.debug(f"Stamping '{comp_id}': Y={y_stamp:.3e} S between nodes {n1} ('{port1_net_name}') and {n2} ('{port2_net_name}')")
+                logger.debug(f"Stamping '{comp_id}': Y={y_stamp} S between nodes {n1} ('{port1_net_name}') and {n2} ('{port2_net_name}')")
 
                 # Stamp Yn matrix (Nodal Admittance part)
                 self._add_stamp(n1, n1, y_stamp)

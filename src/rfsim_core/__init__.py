@@ -23,7 +23,7 @@ from .components import (
     ComponentError,
 )
 from .circuit_builder import CircuitBuilder, CircuitBuildError
-from .simulation import run_simulation, SimulationError, MnaInputError, SingularMatrixError
+from .simulation import run_simulation, run_sweep, SimulationError, MnaInputError, SingularMatrixError
 
 __all__ = [
     # Units
@@ -40,5 +40,5 @@ __all__ = [
     # Builder
     "CircuitBuilder", "CircuitBuildError",
     # Simulation
-    "SimulationError", "MnaInputError", "SingularMatrixError"
+    "SimulationError", "MnaInputError", "SingularMatrixError", "run_sweep", "run_simulation"
 ]

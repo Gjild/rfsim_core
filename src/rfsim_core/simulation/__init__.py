@@ -1,7 +1,7 @@
 # src/rfsim_core/simulation/__init__.py
 from .mna import MnaAssembler, MnaInputError
 from .solver import solve_mna, SingularMatrixError
-from .execution import run_simulation, SimulationError
+from .execution import run_simulation, run_sweep, SimulationError
 
 __all__ = [
     "MnaAssembler",
@@ -9,5 +9,6 @@ __all__ = [
     "solve_mna",
     "SingularMatrixError",
     "run_simulation",
+    "run_sweep",
     "SimulationError",
 ]

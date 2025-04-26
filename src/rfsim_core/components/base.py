@@ -55,7 +55,7 @@ class ComponentBase(ABC):
         pass
 
     @abstractmethod
-    def get_admittance(self, freq_hz: np.ndarray | float) -> Quantity:
+    def get_admittance(self, freq_hz: np.ndarray) -> Quantity:
         """
         Calculates the complex admittance of the component at the given frequency(ies).
 
