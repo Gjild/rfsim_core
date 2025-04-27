@@ -35,25 +35,33 @@ class MnaAssembler:
         Raises:
             MnaInputError: If circuit is invalid or has configuration issues.
         """
+        # Check if it's a simulation-ready circuit
         if not isinstance(circuit, Circuit) or not hasattr(circuit, 'sim_components'):
-             raise MnaInputError("Circuit object must be processed by CircuitBuilder first.")
+             raise MnaInputError("Circuit object must be simulation-ready (output of CircuitBuilder).")
         if not circuit.nets:
              raise MnaInputError("Circuit contains no nets.")
+        if not circuit.sim_components and not circuit.external_ports:
+            # Allow circuits with only external ports (e.g., just measuring ports connected together)
+            # But warn if there are no components *and* no ports.
+             logger.warning(f"Circuit '{circuit.name}' contains no components and no external ports.")
+        elif not circuit.sim_components:
+             logger.warning(f"Circuit '{circuit.name}' contains no components, only external ports.")
 
         self.circuit = circuit
         self.ureg = ureg
+        # Use the sim_components from the passed-in simulation-ready circuit
         self.sim_components: Dict[str, ComponentBase] = circuit.sim_components
-        # Need access to the raw component data for port->net mapping during stamping
+        # Still need raw component data for port->net mapping during stamping
         self.raw_components: Dict[str, ComponentData] = circuit.components
 
-        # --- Frequency Independent Setup (Node maps, port info) ---
+        # --- Frequency Independent Setup ---
         self.node_map: Dict[str, int] = {}
         self.node_count: int = 0
-        self.port_indices: List[int] = []
+        self.port_indices: List[int] = [] # Full indices
         self.port_names: List[str] = []
         self.port_ref_impedances: Dict[str, Quantity] = {}
     
-        # --- Indices relative to REDUCED system (ground removed) ---
+        # --- Indices relative to REDUCED system ---
         self._external_node_indices_reduced: List[int] = []
         self._internal_node_indices_reduced: List[int] = []
 
@@ -67,10 +75,10 @@ class MnaAssembler:
             self._assign_node_indices()
             self._store_reference_impedances()
             self._identify_reduced_indices()
-            self._compute_sparsity_pattern()
+            self._compute_sparsity_pattern() # Requires node map and components
         except Exception as e:
             logger.error(f"Error during MNA Assembler initialization: {e}", exc_info=True)
-            if isinstance(e, (pint.DimensionalityError, ValueError, MnaInputError)):
+            if isinstance(e, (pint.DimensionalityError, ValueError, MnaInputError, ComponentError)): # Added ComponentError
                  raise MnaInputError(f"Initialization failed: {e}") from e
             else:
                  raise
@@ -195,66 +203,90 @@ class MnaAssembler:
         rows, cols, data = [], [], []
         self._shape_full = (self.node_count, self.node_count) # Ensure shape is set
 
+        # Check if there are components to process
+        if not self.sim_components:
+             logger.debug("No simulation components found, sparsity pattern will be empty (diagonal only if needed).")
+             # Handle case with only ports later if necessary, for now pattern is empty
+             # Create empty pattern arrays
+             self._cached_rows = np.array([], dtype=int)
+             self._cached_cols = np.array([], dtype=int)
+             self._sparsity_nnz = 0
+             return # Exit early
+
         # Iterate through simulation-ready components to get their type and connectivity
         for comp_id, sim_comp in self.sim_components.items():
-            comp_data = self.raw_components[comp_id] # Get raw data for port->net map
+            # Need raw data for port->net map
+            if comp_id not in self.raw_components:
+                 # This would indicate an internal inconsistency
+                 raise MnaInputError(f"Internal Error: Simulation component '{comp_id}' not found in raw component data during sparsity calculation.")
+            comp_data = self.raw_components[comp_id]
             ComponentClass = type(sim_comp)
 
             try:
-                # Get declared connectivity for this component *type*
                 connectivity = ComponentClass.declare_connectivity()
-                declared_ports = set(ComponentClass.declare_ports()) # For validation
+                declared_ports = set(ComponentClass.declare_ports())
 
                 logger.debug(f"Component '{comp_id}' (type {ComponentClass.component_type_str}) declared connectivity: {connectivity}")
 
-                # For each connected pair declared by the type...
                 for port_id1, port_id2 in connectivity:
-                    # Check if these ports actually exist in the instance connection
-                    if port_id1 not in comp_data.ports or port_id2 not in comp_data.ports:
-                        # This might happen if declare_connectivity is inconsistent with declare_ports
-                        # or if user didn't connect all ports needed for internal paths.
-                         logger.warning(f"Sparsity calculation for '{comp_id}': Connectivity declared between ports '{port_id1}' and '{port_id2}', but one or both are not connected in the instance. Skipping this pair for sparsity.")
-                         continue
+                    # Basic validation: are these ports declared by the class?
                     if port_id1 not in declared_ports or port_id2 not in declared_ports:
-                         # Should be caught by builder, but check defensively
-                         logger.error(f"Internal Error: Sparsity calculation for '{comp_id}': Connectivity uses ports '{port_id1}' or '{port_id2}' which are not in declared_ports {declared_ports}. Fix component definition.")
-                         continue
+                         raise ComponentError(f"Component type '{ComponentClass.component_type_str}' declares connectivity between '{port_id1}' and '{port_id2}', but one or both are not in its declared_ports list {declared_ports}. Fix component definition.")
+
+                    # Check if these ports actually exist AND ARE CONNECTED in the instance
+                    port1_obj = comp_data.ports.get(port_id1)
+                    port2_obj = comp_data.ports.get(port_id2)
+
+                    if not port1_obj or not port1_obj.net:
+                        logger.warning(f"Sparsity calculation for '{comp_id}': Declared connectivity uses port '{port_id1}', but it's not connected in the instance. Skipping pair ({port_id1}, {port_id2}).")
+                        continue
+                    if not port2_obj or not port2_obj.net:
+                        logger.warning(f"Sparsity calculation for '{comp_id}': Declared connectivity uses port '{port_id2}', but it's not connected in the instance. Skipping pair ({port_id1}, {port_id2}).")
+                        continue
 
                     # Get the nets these ports are connected to
-                    net1_name = comp_data.ports[port_id1].net.name
-                    net2_name = comp_data.ports[port_id2].net.name
+                    net1_name = port1_obj.net.name
+                    net2_name = port2_obj.net.name
 
                     # Get the global node indices for these nets
                     n1 = self.node_map[net1_name]
                     n2 = self.node_map[net2_name]
 
-                    # Add the four non-zero entries for this connection to the COO pattern
-                    # (n1, n1), (n1, n2), (n2, n1), (n2, n2)
+                    # Add non-zero entries for this connection to the COO pattern
                     # Use a dummy value (1.0) for pattern calculation
+                    # The helper handles bounds checks
                     self._add_to_coo_pattern(rows, cols, data, n1, n1, 1.0)
-                    self._add_to_coo_pattern(rows, cols, data, n1, n2, 1.0) # Sign doesn't matter for pattern
-                    self._add_to_coo_pattern(rows, cols, data, n2, n1, 1.0) # Sign doesn't matter for pattern
+                    if n1 != n2: # Avoid adding off-diagonal twice if self-loop
+                        self._add_to_coo_pattern(rows, cols, data, n1, n2, 1.0)
+                        self._add_to_coo_pattern(rows, cols, data, n2, n1, 1.0)
                     self._add_to_coo_pattern(rows, cols, data, n2, n2, 1.0)
 
+
             except KeyError as e:
-                raise MnaInputError(f"Error getting node index for component '{comp_id}' during pattern build: Net '{e}' not in map.")
+                # More specific error message for net name not found
+                raise MnaInputError(f"Error getting node index for component '{comp_id}' during pattern build: Net name '{e}' (from port connection) not found in node map. Check netlist connections.")
             except AttributeError as e:
-                raise MnaInputError(f"Error accessing connection for component '{comp_id}' during pattern build: {e}.")
+                 # Catch errors like trying to access .net on None if port lookup failed unexpectedly
+                 raise MnaInputError(f"Error accessing port/net connection for component '{comp_id}' during pattern build: {e}. Check netlist structure.")
+            except ComponentError as e: # Catch specific ComponentError raised above
+                 logger.error(f"Component definition error for '{comp_id}' type '{ComponentClass.__name__}': {e}")
+                 raise # Re-raise ComponentError
             except Exception as e:
                 logger.error(f"Unexpected error getting connectivity for component '{comp_id}' type '{ComponentClass.__name__}': {e}", exc_info=True)
                 raise MnaInputError(f"Failed to get connectivity for component '{comp_id}': {e}") from e
 
-        # Create sparse matrix from COO lists to consolidate duplicates & get final pattern
+        # Create sparse matrix from COO lists (unchanged logic)
         try:
             if not rows: # Handle empty circuit or circuit with no connected components
-                logger.warning("No component connectivity found to build sparsity pattern. Matrix will be empty.")
+                logger.debug("No component connectivity found to build sparsity pattern. Using empty pattern.")
                 temp_coo = sp.coo_matrix(self._shape_full, dtype=np.complex128)
             else:
                 temp_coo = sp.coo_matrix((data, (rows, cols)), shape=self._shape_full, dtype=np.complex128)
 
+            # Consolidate duplicates (important!) and convert to CSC/COO
             temp_csc = temp_coo.tocsc()
-            temp_csc.eliminate_zeros() # Good practice
-            final_coo = temp_csc.tocoo() # Get final pattern indices after consolidation
+            temp_csc.eliminate_zeros()
+            final_coo = temp_csc.tocoo() # Get final pattern indices
 
             self._cached_rows = final_coo.row
             self._cached_cols = final_coo.col
@@ -264,14 +296,14 @@ class MnaAssembler:
         except Exception as e:
             logger.error(f"Failed to create sparse matrix for sparsity pattern: {e}", exc_info=True)
             raise RuntimeError(f"Failed to compute MNA sparsity pattern: {e}") from e
+        
 
     def _add_to_coo_pattern(self, rows: list, cols: list, data: list, r: int, c: int, val: complex):
         """ Helper for adding to COO lists during pattern generation. """
-        # (Logic remains the same - bounds check)
         if not (0 <= r < self.node_count and 0 <= c < self.node_count):
-            logger.error(f"Internal Error (Pattern): Stamp indices ({r}, {c}) out of bounds ({self.node_count}).")
-            return
-         # Add non-zero value (1.0 used for pattern)
+            # This indicates a bug in index calculation or component definition
+            raise MnaInputError(f"Internal Error (Pattern): Stamp indices ({r}, {c}) out of bounds for matrix size {self.node_count}.")
+        # Add non-zero value (1.0 used for pattern)
         if abs(val) > 1e-18: # Basic check against zero
             rows.append(r)
             cols.append(c)
@@ -282,12 +314,15 @@ class MnaAssembler:
         Assembles the N x N *full* MNA matrix (Yn_full) for a specific frequency > 0,
         using generalized component stamps and the cached sparsity pattern.
         """
-        if not freq_hz > 0:
-             raise MnaInputError(f"MNA Assembly requires frequency > 0 Hz. Got {freq_hz} Hz.")
+        if freq_hz < 0:
+             raise MnaInputError(f"MNA Assembly requires frequency >= 0 Hz. Got {freq_hz} Hz.")
         if self._cached_rows is None or self._cached_cols is None:
              raise RuntimeError("Sparsity pattern was not computed or is invalid.")
-
-        logger.debug(f"Assembling MNA matrix for {freq_hz:.4e} Hz using cached pattern (NNZ={self._sparsity_nnz})...")
+        
+        freq_str = f"{freq_hz:.4e} Hz"
+        if freq_hz == 0:
+            freq_str = "0 Hz (DC - component value eval)"
+        logger.debug(f"Assembling MNA matrix for {freq_str} using cached pattern (NNZ={self._sparsity_nnz})...")
 
         # Initialize data array for the current frequency based on cached pattern
         mna_data = np.zeros(self._sparsity_nnz, dtype=np.complex128)
@@ -297,23 +332,30 @@ class MnaAssembler:
         }
 
         # Helper to add value to the correct index in mna_data
-        def add_value_to_data(r: int, c: int, value: complex):
+        def add_value_to_data(r: int, c: int, value: complex, comp_id_for_err: str):
             """Adds a value to the MNA data array using the precomputed map."""
             key = (r, c)
             if key in rc_to_data_idx:
                 mna_data[rc_to_data_idx[key]] += value
             else:
-                # This *shouldn't* happen if sparsity pattern is correct,
-                # but log if it does. It means a component is trying to stamp
-                # a location that wasn't predicted by declare_connectivity.
-                if abs(value) > 1e-15: # Log only if value is significant
-                    logger.warning(f"Attempted to stamp non-zero value ({value:.2e}) at ({r}, {c}) which is not in the cached sparsity pattern. Check component's declare_connectivity(). Ignoring stamp.")
-
+                # A component is trying to stamp a location that
+                # wasn't predicted by declare_connectivity. This is an error.
+                if abs(value) > 1e-15: # Only raise if the value is significant
+                    raise MnaInputError(
+                        f"Component '{comp_id_for_err}' attempted to stamp non-zero value ({value:.3e}) "
+                        f"at matrix location ({r}, {c}), which is outside the sparsity pattern predicted by its "
+                        f"'declare_connectivity()' method. Ensure the method accurately reflects all "
+                        f"connections modified by 'get_mna_stamps()'."
+                    )
+                # If value is effectively zero, we can ignore it silently.
 
         # --- Stamp Simulation Components using Generalized Method ---
-        current_freq_array = np.array([freq_hz]) # Pass frequency as array
+        current_freq_array = np.array([freq_hz]) # Pass frequency as array even if scalar
         for comp_id, sim_comp in self.sim_components.items():
-            comp_data = self.raw_components[comp_id] # Raw data for port->net lookup
+            # Get raw data for port->net lookup
+            if comp_id not in self.raw_components:
+                raise MnaInputError(f"Internal Error: Simulation component '{comp_id}' not found in raw component data during assembly.")
+            comp_data = self.raw_components[comp_id]
             try:
                 # Get list of stamp contributions from the component
                 stamp_infos = sim_comp.get_mna_stamps(current_freq_array)
@@ -325,85 +367,82 @@ class MnaAssembler:
                      # --- Enforce Contract ---
                      if not isinstance(admittance_matrix_qty, Quantity):
                          raise TypeError(f"Comp '{comp_id}' stamp {stamp_idx} matrix != Quantity")
-                     if not admittance_matrix_qty.check('siemens'):
-                         raise pint.DimensionalityError(admittance_matrix_qty.units, ureg.siemens, msg=f"Comp '{comp_id}' stamp {stamp_idx} matrix")
+                     if not admittance_matrix_qty.check('siemens'): # Use check for dimension name
+                         raise pint.DimensionalityError(admittance_matrix_qty.units, ureg.siemens, extra_msg=f"Comp '{comp_id}' stamp {stamp_idx} matrix")
 
                      # Extract numerical matrix/array (in Siemens)
                      # Need to handle scalar freq vs array freq output from component
                      stamp_values = admittance_matrix_qty.to(ureg.siemens).magnitude
 
-                     # If component handled freq array, select the data for the current freq
                      if stamp_values.ndim == 3:
-                         # Handles (num_freqs, N, N), including the case (1, N, N)
                          if stamp_values.shape[0] == 1:
-                             # Correctly extract the 2D slice for the single frequency case
                              current_stamp_matrix = stamp_values[0, :, :]
-                             logger.debug(f"Extracted 2D stamp from 3D shape {stamp_values.shape} for single frequency.")
                          else:
-                             # This case shouldn't be hit in the current single-frequency loop,
-                             # but handle defensively if component somehow got multi-freq array.
+                             # Should not happen in single freq assembly loop
                              logger.warning(f"Component '{comp_id}' returned unexpected multi-frequency shape {stamp_values.shape} within single-frequency assembly loop. Using first slice.")
                              current_stamp_matrix = stamp_values[0, :, :]
-
                      elif stamp_values.ndim == 2:
-                         # Handles (N, N) case (e.g., scalar frequency input or freq-independent component)
                          current_stamp_matrix = stamp_values
-                         logger.debug(f"Using 2D stamp directly shape={stamp_values.shape}.")
-
+                     elif stamp_values.ndim == 0 and stamp_values.size == 1 and len(port_ids) == 1:
+                         # Handle scalar stamp for 1-port component case?
+                         current_stamp_matrix = np.array([[stamp_values]]) # Make it 2D (1x1)
                      else:
-                         # Handles truly unexpected shapes (1D, 4D+, etc.)
-                         raise ValueError(f"Component '{comp_id}' returned stamp with unexpected dimension/shape {stamp_values.shape} (expected 2D or 3D).")
+                         raise ValueError(f"Component '{comp_id}' returned stamp with unexpected dimension/shape {stamp_values.shape} (ndim={stamp_values.ndim}, size={stamp_values.size}). Expected 2D (N,N) or 3D (1,N,N).")
 
 
-                     # Get global node indices corresponding to the port_ids for this instance
+                     # Get global node indices (unchanged)
                      global_indices = []
                      valid_ports = True
                      for port_id in port_ids:
-                         if port_id not in comp_data.ports:
+                         port_obj = comp_data.ports.get(port_id)
+                         if not port_obj or not port_obj.net: # Check connection exists
                              logger.error(f"Component '{comp_id}' stamp {stamp_idx} refers to port ID '{port_id}' which is not connected in the netlist instance. Skipping stamp.")
                              valid_ports = False
                              break
-                         net_name = comp_data.ports[port_id].net.name
+                         net_name = port_obj.net.name
+                         if net_name not in self.node_map:
+                             raise MnaInputError(f"Internal Error: Net '{net_name}' from component '{comp_id}' port '{port_id}' not found in node map during assembly.")
                          global_indices.append(self.node_map[net_name])
-                     if not valid_ports: continue # Skip this stamp
+                     if not valid_ports: continue
 
-                     # Check dimensions match
-                     num_ports = len(port_ids)
-                     if current_stamp_matrix.shape != (num_ports, num_ports):
-                         raise ValueError(f"Component '{comp_id}' stamp {stamp_idx} matrix shape {current_stamp_matrix.shape} mismatch with number of ports {num_ports}.")
+                     # Check dimensions match (unchanged)
+                     num_ports_in_stamp = len(port_ids)
+                     if current_stamp_matrix.shape != (num_ports_in_stamp, num_ports_in_stamp):
+                         raise ValueError(f"Component '{comp_id}' stamp {stamp_idx} matrix shape {current_stamp_matrix.shape} mismatch with number of ports {num_ports_in_stamp}.")
 
-                     # Add the elements of the component's stamp matrix to the global MNA data
-                     for i in range(num_ports): # Local row index in stamp_matrix
-                         for j in range(num_ports): # Local col index in stamp_matrix
+                     # Add stamp elements to global MNA data
+                     for i in range(num_ports_in_stamp):
+                         for j in range(num_ports_in_stamp):
                              global_row = global_indices[i]
                              global_col = global_indices[j]
                              stamp_val = current_stamp_matrix[i, j]
 
-                             # Add using the helper (handles check against sparsity pattern)
-                             add_value_to_data(global_row, global_col, stamp_val)
+                             # Add using the helper (now raises error on sparsity mismatch)
+                             add_value_to_data(global_row, global_col, stamp_val, comp_id)
 
                      logger.debug(f"Stamped '{comp_id}' contribution {stamp_idx} for ports {port_ids} -> nodes {global_indices}")
 
+            except MnaInputError: raise # Propagate sparsity errors immediately
+            except ComponentError as e: # Catch component-level errors (e.g., bad params during get_stamps)
+                 logger.error(f"Component error during stamp calculation for '{comp_id}' at {freq_str}: {e}", exc_info=True)
+                 raise ComponentError(f"Failed processing component '{comp_id}' stamps at {freq_str}: {e}") from e
             except Exception as e:
-                logger.error(f"Failed to get/process stamps for component '{comp_id}' at {freq_hz} Hz: {e}", exc_info=True)
-                # Decide whether to raise, or just log and continue (making the matrix potentially wrong)
-                # Raising is safer to indicate simulation failure.
-                raise ComponentError(f"Failed processing component '{comp_id}' stamps at {freq_hz} Hz: {e}") from e
+                logger.error(f"Unexpected failure getting/processing stamps for component '{comp_id}' at {freq_str}: {e}", exc_info=True)
+                raise ComponentError(f"Unexpected failure processing component '{comp_id}' stamps at {freq_str}: {e}") from e
 
         # --- Create Final Sparse Matrix ---
         try:
-            # Use the cached pattern indices and the just-computed data
+            # Use the cached pattern indices and the computed data
             Yn_full_coo = sp.coo_matrix(
                 (mna_data, (self._cached_rows, self._cached_cols)),
                 shape=self._shape_full,
                 dtype=np.complex128
             )
-            # Convert to CSC for efficient solvers later, eliminate explicit zeros
             Yn_full_csc = Yn_full_coo.tocsc()
             Yn_full_csc.eliminate_zeros()
 
-            logger.debug(f"Full MNA matrix assembly complete for {freq_hz:.4e} Hz. Shape: {Yn_full_csc.shape}, NNZ: {Yn_full_csc.nnz}")
+            logger.debug(f"Full MNA matrix assembly complete for {freq_str}. Shape: {Yn_full_csc.shape}, NNZ: {Yn_full_csc.nnz}")
             return Yn_full_csc
         except Exception as e:
-            logger.error(f"Failed to create final sparse matrix at {freq_hz} Hz: {e}", exc_info=True)
-            raise RuntimeError(f"Failed creating sparse MNA matrix at {freq_hz} Hz: {e}") from e
+            logger.error(f"Failed to create final sparse matrix at {freq_str}: {e}", exc_info=True)
+            raise RuntimeError(f"Failed creating sparse MNA matrix at {freq_str}: {e}") from e

@@ -1,12 +1,13 @@
 import logging
 from typing import Dict, Any, Optional
 
-from .data_structures import Circuit as ParsedCircuitData # Input is parsed data
+from .data_structures import Circuit
 from .data_structures import Component as ComponentData
 # Import the actual simulation-ready component base/registry
 from .components.base import ComponentBase, COMPONENT_REGISTRY, ComponentError
 from .parameters import ParameterManager, ParameterError
 from .units import ureg, pint, Quantity
+import copy
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ class CircuitBuilder:
         self._ureg = ureg # Use the shared registry
         logger.info("CircuitBuilder initialized.")
 
-    def build_circuit(self, parsed_data: ParsedCircuitData) -> ParsedCircuitData:
+    def build_circuit(self, parsed_data: Circuit) -> Circuit:
         """
         Processes the parsed circuit data, validates component parameters,
         and populates the circuit with simulation-ready component instances.
@@ -44,12 +45,35 @@ class CircuitBuilder:
         if param_manager is None:
              # Should not happen if parser worked, but defensively check
              raise CircuitBuildError("ParameterManager not found in parsed circuit data.")
+        
+
+        # --- Create a new Circuit object to avoid mutating the input ---
+        # Perform a deep copy of essential structural elements.
+        # ParameterManager is assumed immutable or safe to share reference.
+        # sim_components will be added specifically.
+        try:
+            sim_circuit = Circuit(
+                name=parsed_data.name,
+                nets=copy.deepcopy(parsed_data.nets),
+                external_ports=copy.deepcopy(parsed_data.external_ports),
+                external_port_impedances=copy.deepcopy(parsed_data.external_port_impedances),
+                parameter_manager=param_manager, # Share reference
+                ground_net_name=parsed_data.ground_net_name,
+                # Deep copy components (raw data) if needed downstream, otherwise could be shallow
+                components=copy.deepcopy(parsed_data.components)
+            )
+            # Add dict for components for simulation
+            setattr(sim_circuit, 'sim_components', {})
+            logger.debug(f"Created new Circuit object '{sim_circuit.name}' for simulation.")
+        except Exception as e:
+            logger.error(f"Failed to create base simulation circuit object: {e}", exc_info=True)
+            raise CircuitBuildError(f"Failed to create base simulation circuit object: {e}") from e
 
         processed_components: Dict[str, ComponentBase] = {}
         errors = []
 
         # --- Perform Build-Specific Validations and Instantiation ---
-        for instance_id, comp_data in parsed_data.components.items():
+        for instance_id, comp_data in parsed_data.components.items(): # Iterate original data
             comp_type_str = comp_data.component_type
             logger.debug(f"Building component '{instance_id}' of type '{comp_type_str}'")
 
@@ -69,12 +93,11 @@ class CircuitBuilder:
                 if extra_ports:
                      errors.append(f"Component '{instance_id}' (type '{comp_type_str}') uses undeclared ports: {sorted(list(extra_ports))}. Declared ports are: {sorted(list(declared_ports_set))}.")
 
-                # Check for declared ports that *must* be connected but aren't
-                # For now, we only check if used ports are valid. A stricter check might be:
-                # missing_ports = declared_ports_set - used_ports_set
-                # if missing_ports:
-                #    errors.append(f"Component '{instance_id}' (type '{comp_type_str}') is missing connections for declared ports: {missing_ports}.")
-                # Let's keep it relaxed for now: only used ports must be declared.
+                # Check for declared ports that *must* be connected but aren't**
+                missing_ports = declared_ports_set - used_ports_set
+                if missing_ports:
+                   # Declared ports must be connected.
+                   errors.append(f"Component '{instance_id}' (type '{comp_type_str}') is missing required connections for declared ports: {sorted(list(missing_ports))}. Connected ports are: {sorted(list(used_ports_set))}.")
 
             except Exception as e:
                 errors.append(f"Error validating ports for component '{instance_id}': {e}")
@@ -99,7 +122,7 @@ class CircuitBuilder:
                 )
                 processed_components[instance_id] = sim_component
                 logger.debug(f"Successfully created simulation component: {sim_component!r}")
-            except (ComponentError, ValueError) as e:
+            except (ComponentError, ValueError, TypeError) as e: # Added TypeError
                 # Catch errors during component's __init__
                 errors.append(f"Instantiation failed for component '{instance_id}': {e}")
                 continue # Skip this component
@@ -109,11 +132,12 @@ class CircuitBuilder:
             logger.error(error_msg)
             raise CircuitBuildError(error_msg)
         
-        # Add the processed components to the circuit object
-        setattr(parsed_data, 'sim_components', processed_components) # Keep mutation approach for now
-        logger.info(f"Successfully built circuit '{parsed_data.name}'. Created {len(processed_components)} simulation-ready components.")
+        # Add the processed components to the *new* simulation circuit object
+        sim_circuit.sim_components = processed_components # Directly assign the dict
 
-        return parsed_data  
+        logger.info(f"Successfully built circuit '{sim_circuit.name}'. Created {len(processed_components)} simulation-ready components.")
+
+        return sim_circuit 
 
     def _process_component_parameters(
         self,
@@ -128,17 +152,16 @@ class CircuitBuilder:
         raw_params = comp_data.parameters
         instance_id = comp_data.instance_id
 
-        # Check for unexpected parameters provided in the netlist
+        # Check for unexpected parameters provided in the netlist (Error not Warning)**
         for raw_param_name in raw_params:
             if raw_param_name not in declared_params:
-                # This should now be a warning, as some components might allow optional params?
-                # Or stricter: Error if not declared. Let's stick to warning.
-                logger.warning(f"Component '{instance_id}' provided parameter '{raw_param_name}' which is not declared by type '{comp_data.component_type}'. Declared: {list(declared_params.keys())}. Ignoring.")
+                 # Raise an error for undeclared parameters to enforce strict interface adherence
+                 raise ParameterError(f"Component '{instance_id}' (type '{comp_data.component_type}') was provided parameter '{raw_param_name}' which is not declared by the component type. Declared parameters are: {list(declared_params.keys())}.")
 
         # Process declared parameters
         for param_name, expected_dim_str in declared_params.items():
             if param_name not in raw_params:
-                 # Make required parameters explicit? Assume all declared are required for now.
+                # Make required parameters explicit? Assume all declared are required for now.
                 raise ParameterError(f"Required parameter '{param_name}' missing for component '{instance_id}'. Declared parameters: {list(declared_params.keys())}")
 
             raw_value = raw_params[param_name]
@@ -176,7 +199,7 @@ class CircuitBuilder:
                         self._ureg.parse_expression(expected_dim_str).units, # Get target units for better msg
                         resolved_quantity.dimensionality,
                         self._ureg.parse_expression(expected_dim_str).dimensionality,
-                        extra_msg=f"Parameter '{param_name}' in component '{instance_id}'"
+                        extra_msg=f"for parameter '{param_name}' in component '{instance_id}'" # Simplified extra_msg
                     )
 
                 processed[param_name] = resolved_quantity
@@ -185,12 +208,14 @@ class CircuitBuilder:
             except pint.DimensionalityError as e:
                 # Construct a more informative message
                 err_msg = (
-                    f"Dimensionality mismatch for {e.extra_msg}. " # Use the msg field we set
-                    f"Got value {resolved_quantity:~P} (dimensionality {e.dim1}), "
-                    f"but expected dimension compatible with '{expected_dim_str}' ({e.dim2})."
+                    f"Dimensionality mismatch {e.extra_msg}. " # Use the msg field we set
+                    f"Got value {resolved_quantity:~P} (units '{e.units1}', dimensionality '{e.dim1}'), "
+                    f"but expected dimension compatible with '{expected_dim_str}' (target units '{e.units2}', dimensionality '{e.dim2}')."
                 )
                 logger.error(err_msg)
                 # Re-raise with the enhanced message if possible, or wrap it
-                raise pint.DimensionalityError(e.units1, e.units2, e.dim1, e.dim2, err_msg) from e
+                # Re-raising the original exception preserves the traceback
+                e.extra_msg = err_msg # Modify the message in place
+                raise e # Re-raise the modified exception
 
         return processed

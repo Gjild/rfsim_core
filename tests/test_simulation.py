@@ -257,33 +257,44 @@ ports:
 
 # --- Error Handling Tests ---
 
-def test_sweep_invalid_frequency_input(parser, builder):
-    # Test contents remain the same, checking input validation of run_sweep
+def test_sweep_invalid_frequency_input(parser, builder, caplog):
     yaml_netlist = f"""
-sweep: {{ type: list, points: ['1 GHz'] }}
+sweep: {{ type: list, points: ['1 GHz'] }} # Need valid sweep for parsing
 components:
   - type: Resistor
     id: R1
-    ports: {{ {PORT_1}: P1, {PORT_2}: gnd }} # Use integer ports
+    ports: {{ {PORT_1}: P1, {PORT_2}: gnd }}
     parameters: {{resistance: '50 ohm'}}
 ports:
   - {{id: P1, reference_impedance: '50 ohm'}}
 ground_net: 'gnd'
 """
     built_circuit, _ = parse_and_build(parser, builder, yaml_netlist)
-    with pytest.raises(MnaInputError, match="Frequency sweep array cannot be empty"):
-        run_sweep(built_circuit, np.array([]))
+    num_ports = len(built_circuit.external_ports) # Get expected port count
+
+    # Test empty array: Should WARN and return empty results
+    empty_freq = np.array([])
+    with caplog.at_level(logging.WARNING):
+        freqs_out_empty, y_matrices_empty = run_sweep(built_circuit, empty_freq)
+    assert "Frequency sweep array is empty" in caplog.text
+    assert freqs_out_empty.shape == (0,)
+    assert y_matrices_empty.shape == (0, num_ports, num_ports) # Check shape (0, N, N)
+
+    # Test non-1D array
     with pytest.raises(MnaInputError, match="must be provided as a 1D NumPy array"):
         run_sweep(built_circuit, np.array([[1e6, 2e6]]))
-    with pytest.raises(MnaInputError, match="All frequencies in the sweep must be > 0 Hz"):
-        run_sweep(built_circuit, np.array([0.0, 1e9]))
-    with pytest.raises(MnaInputError, match="All frequencies in the sweep must be > 0 Hz"):
-        run_sweep(built_circuit, np.array([0.0]))
-    with pytest.raises(MnaInputError, match="All frequencies in the sweep must be > 0 Hz"):
+
+    # Test F=0 is allowed
+    run_sweep(built_circuit, np.array([0.0, 1e9])) # Should pass
+    run_sweep(built_circuit, np.array([0.0]))      # Should pass
+
+    # Test F<0 still errors
+    with pytest.raises(MnaInputError, match="All frequencies in the sweep must be >= 0 Hz"):
         run_sweep(built_circuit, np.array([-1e9, 1e9]))
+    with pytest.raises(MnaInputError, match="All frequencies in the sweep must be >= 0 Hz"):
+        run_sweep(built_circuit, np.array([-1e6]))
 
 def test_circuit_not_built_error(parser):
-    # Test contents remain the same
     yaml_netlist = f"""
 sweep: {{ type: list, points: ['1 MHz'] }}
 components:
@@ -295,13 +306,14 @@ ports: [{{id: P1, reference_impedance: '50'}}]
 """
     circuit, freq_array = parser.parse(yaml_netlist)
     assert not hasattr(circuit, 'sim_components')
-    with pytest.raises(MnaInputError, match="Circuit object must be processed by CircuitBuilder first"):
+    # --- UPDATE Error Message Match ---
+    with pytest.raises(MnaInputError, match="Input circuit object does not appear to be simulation-ready"):
         run_sweep(circuit, freq_array)
 
-def test_run_simulation_helper_f_zero_error(parser, builder):
-    # Test contents remain the same
+
+def test_run_simulation_allows_f_zero_errors_negative(parser, builder, freq_zero, caplog):
     yaml_netlist = f"""
-sweep: {{ type: list, points: ['1 GHz'] }}
+sweep: {{ type: list, points: ['1 GHz'] }} # Need a valid sweep for parsing
 components:
   - type: Resistor
     id: R1
@@ -312,9 +324,15 @@ ports:
 ground_net: 'gnd'
 """
     built_circuit, _ = parse_and_build(parser, builder, yaml_netlist)
-    with pytest.raises(MnaInputError, match="Single frequency simulation requires freq_hz > 0"):
-        run_simulation(built_circuit, 0.0)
-    with pytest.raises(MnaInputError, match="Single frequency simulation requires freq_hz > 0"):
+
+    # Should succeed for F=0
+    with caplog.at_level(logging.WARNING):
+        y_matrix = run_simulation(built_circuit, freq_zero) # Use freq_zero fixture (0.0)
+    assert y_matrix is not None
+    assert "Running run_simulation at F=0" in caplog.text # Check warning
+
+    # Should error for F<0
+    with pytest.raises(MnaInputError, match="Single frequency simulation requires freq_hz >= 0"):
         run_simulation(built_circuit, -1e6)
 
 def test_pi_network_intrinsic_y(parser, builder, freq_1ghz):
