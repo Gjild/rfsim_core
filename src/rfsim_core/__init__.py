@@ -1,15 +1,10 @@
-# src/rfsim_core/__init__.py
 import logging
 from .log_config import setup_logging
 
-# Configure logging when the package is imported
 setup_logging()
-
-# Example: Get a logger for this specific module
 logger = logging.getLogger(__name__)
 logger.info("RFSim Core package initialized.")
 
-# Expose key classes and functions for easier access
 from .units import ureg, pint, Quantity
 from .data_structures import Circuit, Component, Net, Port
 from .parser import NetlistParser, ParsingError, SchemaValidationError
@@ -21,24 +16,30 @@ from .components import (
     Inductor,
     COMPONENT_REGISTRY,
     ComponentError,
+    LARGE_ADMITTANCE_SIEMENS # Expose the constant
 )
 from .circuit_builder import CircuitBuilder, CircuitBuildError
-from .simulation import run_simulation, run_sweep, SimulationError, MnaInputError, SingularMatrixError
+from .simulation import (
+    SimulationError, MnaInputError, SingularMatrixError,
+    run_sweep, run_simulation
+)
+
 
 __all__ = [
     # Units
     "ureg", "pint", "Quantity",
     # Data Structures
-    "Circuit", "Component", "Net", "Port", 
+    "Circuit", "Component", "Net", "Port",
     # Parser
-    "NetlistParser", "ParsingError", "SchemaValidationError", 
+    "NetlistParser", "ParsingError", "SchemaValidationError",
     # Parameters
     "ParameterManager", "ParameterError",
     # Components Base & Elements
-    "ComponentBase", "Resistor", "Capacitor", "Inductor", 
-    "COMPONENT_REGISTRY", "ComponentError",
+    "ComponentBase", "Resistor", "Capacitor", "Inductor",
+    "COMPONENT_REGISTRY", "ComponentError", "LARGE_ADMITTANCE_SIEMENS",
     # Builder
     "CircuitBuilder", "CircuitBuildError",
     # Simulation
-    "SimulationError", "MnaInputError", "SingularMatrixError", "run_sweep", "run_simulation"
+    "SimulationError", "MnaInputError", "SingularMatrixError",
+    "run_sweep", "run_simulation"
 ]
