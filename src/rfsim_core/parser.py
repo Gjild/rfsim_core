@@ -5,10 +5,11 @@ import cerberus
 import pint
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, Union, TextIO, Tuple, Set
+from typing import Dict, Any, Union, TextIO, Tuple, Set, List # Added List
 
 from .data_structures import Circuit, Component, Net, Port
-from .parameters import ParameterManager, ParameterError
+# ParameterManager is no longer directly used here for population
+from .parameters import ParameterManager, ParameterError, ParameterDefinitionError # Added ParameterDefinitionError
 from .components import ComponentError
 from .units import ureg
 
@@ -29,18 +30,38 @@ class ParsingError(ValueError):
 class NetlistParser:
     """
     Parses and validates a circuit netlist from a YAML source.
-    Builds an internal Circuit representation and extracts sweep frequencies.
+    Builds an internal Circuit representation containing raw definitions
+    and extracts sweep frequencies. It does *not* build the ParameterManager.
     """
+    # --- Updated Schema for Parameters ---
+    _param_value_schema = {
+        'oneof': [
+            # 1. Simple constant value (string or number)
+            {'type': ['string', 'number']},
+            # 2. Expression definition (requires dimension)
+            {
+                'type': 'dict',
+                'schema': {
+                    'expression': {'type': 'string', 'required': True, 'empty': False},
+                    'dimension': {'type': 'string', 'required': True, 'empty': False},
+                    # Add 'sweepable: true' later in Phase 13 if needed here
+                },
+                'required': True # Ensure the dict itself is present if this rule matches
+            }
+        ]
+    }
     # Schema updated slightly for clarity and sweep validation
     _schema = {
         'circuit_name': {'type': 'string', 'required': False, 'empty': False},
         'ground_net': {'type': 'string', 'required': False, 'empty': False},
         'parameters': {
-            'type': 'dict', 'required': False, 'keysrules': {'type': 'string', 'empty': False},
-            'valuesrules': {'type': ['string', 'number']}
+            'type': 'dict', 'required': False,
+            'keysrules': {'type': 'string', 'empty': False},
+            # Use the more complex schema for values defined above
+            'valuesrules': _param_value_schema
         },
         'components': {
-            'type': 'list', 'required': True, 'minlength': 0, # Allow circuits with only ports?
+            'type': 'list', 'required': True, 'minlength': 0,
             'schema': {
                 'type': 'dict',
                 'schema': {
@@ -52,7 +73,11 @@ class NetlistParser:
                         'valuesrules': {'type': 'string', 'empty': False}
                     },
                     'parameters': {
-                        'type': 'dict', 'required': False, 'keysrules': {'type': 'string', 'empty': False},
+                        # Parameters here are instance-specific overrides/definitions
+                        # Value can be string/number (literal or reference) or expression dict
+                        'type': 'dict', 'required': False,
+                        'keysrules': {'type': 'string', 'empty': False},
+                        'valuesrules': _param_value_schema # Reuse same value rules
                     }
                 }
             }
@@ -64,7 +89,7 @@ class NetlistParser:
                 'schema': {
                     'id': {'type': 'string', 'required': True, 'empty': False},
                     'reference_impedance': {
-                        'type': 'string', 'required': True, 'empty': False
+                        'type': 'string', 'required': True, 'empty': False # Keep as string for now, builder handles it
                     }
                 }
             }
@@ -88,18 +113,18 @@ class NetlistParser:
 
     def parse(self, source: Union[str, Path, TextIO]) -> Tuple[Circuit, np.ndarray]:
         """
-        Parses the YAML netlist source.
+        Parses the YAML netlist source, validates structure, extracts raw data.
 
         Args:
             source: YAML source (path, string, or file-like object).
 
         Returns:
             A tuple containing:
-                - circuit: The populated Circuit object.
+                - circuit: The Circuit object populated with *raw* definitions.
                 - freq_array_hz: NumPy array of frequency points (in Hz, guaranteed > 0).
 
         Raises:
-            FileNotFoundError, yaml.YAMLError, SchemaValidationError, ParsingError, ParameterError.
+            FileNotFoundError, yaml.YAMLError, SchemaValidationError, ParsingError, ParameterError, ComponentError.
         """
         logger.info(f"Starting parsing of netlist source: {type(source)}")
         yaml_content = self._load_yaml(source)
@@ -115,16 +140,14 @@ class NetlistParser:
         ground_name = validated_data.get('ground_net', 'gnd')
         circuit = Circuit(name=circuit_name, ground_net_name=ground_name)
 
-        # 1. Process Global Parameters
-        global_params_data = validated_data.get('parameters', {})
-        try:
-            circuit.parameter_manager = ParameterManager(global_params_data)
-            logger.debug(f"Parameter Manager state:\n{circuit.parameter_manager}")
-        except ParameterError as e:
-             logger.error(f"Failed to initialize ParameterManager: {e}")
-             raise
+        # 1. Store Raw Global Parameter Data (NO ParameterManager construction here)
+        # The CircuitBuilder will process this later.
+        raw_global_params_data = validated_data.get('parameters', {})
+        # Add a temporary attribute to circuit to hold this raw data
+        setattr(circuit, 'raw_global_parameters', raw_global_params_data)
+        logger.debug(f"Stored raw global parameters data: {raw_global_params_data}")
 
-        # 2. Process Components and Connections
+        # 2. Process Components and Connections (Store raw component parameters)
         component_errors = []
         unique_comp_ids = set()
         used_net_names: Set[str] = {ground_name} # Track all nets mentioned
@@ -133,7 +156,8 @@ class NetlistParser:
         for comp_data_raw in validated_data.get('components', []):
             comp_id = comp_data_raw['id']
             comp_type = comp_data_raw['type']
-            comp_params = comp_data_raw.get('parameters', {})
+            # Store raw parameters directly as parsed from YAML (could be str/num or dict)
+            comp_params_raw = comp_data_raw.get('parameters', {})
 
             # Basic Semantic Check: Duplicate component ID
             if comp_id in unique_comp_ids:
@@ -145,21 +169,22 @@ class NetlistParser:
             if comp_type not in COMPONENT_REGISTRY:
                  error_msg = f"Unknown component type '{comp_type}' for instance '{comp_id}'. Registered types: {list(COMPONENT_REGISTRY.keys())}"
                  component_errors.append(error_msg)
-                 raise ComponentError(err_msg)
+                 # Raise immediately? Or collect? Let's collect for now.
+                 continue # Skip this component if type is unknown
 
-            component = Component(instance_id=comp_id, component_type=comp_type, parameters=comp_params)
+            # Create Component data object, storing RAW parameters
+            component = Component(instance_id=comp_id, component_type=comp_type, parameters=comp_params_raw)
             has_error_for_this_comp = False
 
             # Create ports and connect them to nets, count connections
             for port_id, net_name in comp_data_raw['ports'].items():
                 used_net_names.add(net_name) # Keep track of all used net names
                 try:
-                    # Port ID uniqueness *within the component instance* is checked here
                     port = component.add_port(port_id)
                     net = circuit.get_or_create_net(net_name)
 
                     # Establish connections
-                    if port.net is not None: # Should not happen due to add_port check, but safety first
+                    if port.net is not None: # Safety check
                          raise ValueError(f"Internal error: Port '{port_id}' on '{comp_id}' already connected.")
                     port.net = net
                     if component not in net.connected_components:
@@ -169,7 +194,6 @@ class NetlistParser:
                     net_connection_counts[net_name] = net_connection_counts.get(net_name, 0) + 1
                     logger.debug(f"Connected port '{port_id}' of '{comp_id}' to net '{net_name}'. Net count: {net_connection_counts[net_name]}")
 
-                # Establish connections (port -> net, net -> component)
                 except Exception as e:
                     err_msg = f"Error processing connection port='{port_id}', net='{net_name}' for component '{comp_id}': {e}"
                     component_errors.append(err_msg)
@@ -184,7 +208,7 @@ class NetlistParser:
         if component_errors:
             raise ParsingError("Errors occurred during component structure processing:\n- " + "\n- ".join(component_errors))
 
-        # 3. Process External Ports
+        # 3. Process External Ports (Store raw impedance string)
         port_errors = []
         external_port_names = set()
         external_port_nets: Set[str] = set() # Track nets designated as external ports
@@ -199,22 +223,20 @@ class NetlistParser:
             external_port_nets.add(port_id)
 
             try:
-                # Add this line back:
+                # circuit.set_external_port expects impedance as string, which is correct here
                 circuit.set_external_port(port_id, impedance_str)
-                logger.debug(f"Registered external port '{port_id}' via circuit.set_external_port.") # Optional debug log
+                logger.debug(f"Registered external port '{port_id}' with Z0='{impedance_str}'.")
 
             except Exception as e:
-                # Log the specific error during port setting
                 err_msg = f"Error setting external port '{port_id}' in circuit object: {e}"
                 logger.error(err_msg)
-                port_errors.append(err_msg) # Append the specific error
+                port_errors.append(err_msg)
 
         if port_errors:
-            # Ensure the detailed errors are reported
             raise ParsingError("Errors occurred during external port processing:\n- " + "\n- ".join(port_errors))
 
-        # 4. Process Sweep Configuration (No Change Structurally)
-        sweep_data = validated_data.get('sweep') # Schema ensures it exists
+        # 4. Process Sweep Configuration (No Change Needed)
+        sweep_data = validated_data.get('sweep')
         try:
              freq_array_hz = self._parse_sweep(sweep_data)
              logger.info(f"Parsed frequency sweep: {len(freq_array_hz)} points from {freq_array_hz[0]:.3e} Hz to {freq_array_hz[-1]:.3e} Hz.")
