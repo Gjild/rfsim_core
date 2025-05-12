@@ -58,6 +58,7 @@ class ParameterDefinition:
     constant_value_str: Optional[str] = None
     declared_dimension_str: Optional[str] = None
     is_sweepable: bool = False
+    is_value_provided: bool = True # Added to track if value came from YAML
 
     def __post_init__(self):
         owner_ref = f"{self.owner_id}." if self.scope == 'instance' else 'global.'
@@ -67,19 +68,24 @@ class ParameterDefinition:
             raise ValueError("ParameterDefinition name must be a non-empty string.")
         if self.scope not in ['global', 'instance']:
             raise ValueError(f"Invalid scope '{self.scope}' for {param_ref}. Must be 'global' or 'instance'.")
-        if not self.expression_str and not self.constant_value_str:
-            raise ValueError(f"ParameterDefinition {param_ref} must have either expression_str or constant_value_str.")
-        if self.expression_str and self.constant_value_str:
+        
+        # Modified check: only require expression or constant if value is provided
+        if self.is_value_provided and not self.expression_str and not self.constant_value_str:
+            raise ValueError(f"ParameterDefinition {param_ref} must have either expression_str or constant_value_str when is_value_provided is True.")
+        
+        if self.expression_str and self.constant_value_str: # This check remains
             raise ValueError(f"ParameterDefinition {param_ref} cannot have both expression_str and constant_value_str.")
+        
         if self.scope == 'instance' and not (self.owner_id and isinstance(self.owner_id, str)):
             raise ValueError(f"Instance-scoped parameter {param_ref} must have a valid non-empty string owner_id (got: {self.owner_id}).")
         if self.scope == 'global' and self.owner_id is not None:
             raise ValueError(f"Global-scoped parameter {param_ref} cannot have an owner_id (should be None, got: {self.owner_id}).")
         if self.declared_dimension_str is None or not isinstance(self.declared_dimension_str, str):
              raise ValueError(f"ParameterDefinition {param_ref} must have a valid declared_dimension_str string.")
-        
+                        
 # Type alias for context map value
 ContextInfo = Dict[str, Any] # Contains 'definition', 'declared_dimension', 'dependencies', 'sympy_expr'
+
 
 class ParameterManager:
     GLOBAL_SCOPE_PREFIX = "global"
@@ -134,7 +140,7 @@ class ParameterManager:
             self._parse_expressions_and_find_dependencies()
             self._build_dependency_graph()
             self._check_circular_dependencies()
-            self._parse_and_cache_constants()
+            self._parse_and_cache_constants() # Aware of is_value_provided
             self._validate_and_compile_all_expressions()
         except ParameterError as e:
             logger.error(f"ParameterManager build failed: {e}", exc_info=False)
@@ -222,6 +228,11 @@ class ParameterManager:
             context_info['dependencies'] = resolved_deps 
             context_info['sympy_expr'] = None      
 
+            if not definition.is_value_provided: # If value not from YAML, no expression/constant to parse
+                context_info['dependencies'] = set()
+                logger.debug(f"Parameter '{internal_name}' has no value provided from YAML. Skipping dependency parsing.")
+                continue
+
             if definition.constant_value_str and not definition.expression_str:
                 value_str = definition.constant_value_str
                 try:
@@ -253,7 +264,7 @@ class ParameterManager:
                         logger.debug(f"Identified reference dependency for constant '{internal_name}' ('{value_str}'): {resolved_deps}")
                     except (ParameterScopeError, ValueError) as ref_err:
                         raise ParameterDefinitionError(f"Constant value string '{value_str}' for parameter '{internal_name}' is neither a valid literal quantity (e.g., '10 pF') nor a resolvable parameter reference. Error: {ref_err}") from ref_err
-
+        
             elif definition.expression_str:
                 expr_str = definition.expression_str
                 try:
@@ -298,7 +309,14 @@ class ParameterManager:
 
     def _resolve_symbol_to_internal_name(self, symbol_name: str, current_scope: str, current_owner_id: Optional[str]) -> str:
         if '.' in symbol_name:
-            raise ParameterScopeError(f"Internal Error: _resolve_symbol_to_internal_name called with an already qualified name '{symbol_name}'.")
+            # This case should ideally be handled before calling this function,
+            # as _resolve_symbol_to_internal_name is for unqualified symbols.
+            # If it's already qualified, check if it exists.
+            if symbol_name in self._parameter_context_map:
+                return symbol_name
+            else:
+                raise ParameterScopeError(f"Qualified symbol '{symbol_name}' not found in parameter context map.")
+
 
         if current_scope == 'instance' and current_owner_id:
             inst_name = f"{current_owner_id}.{symbol_name}"
@@ -349,7 +367,8 @@ class ParameterManager:
         self._parsed_constants = {}
         for name, ctx_info in self._parameter_context_map.items():
             definition = ctx_info['definition']
-            if definition.constant_value_str and not ctx_info.get('dependencies'):
+            # Only parse if value was provided and it's a constant_value_str with no dependencies
+            if definition.is_value_provided and definition.constant_value_str and not ctx_info.get('dependencies'):
                 try:
                     self._parsed_constants[name] = self._ureg.Quantity(definition.constant_value_str)
                 except Exception as e:
@@ -361,7 +380,7 @@ class ParameterManager:
         compile_errors = []
         num_compiled = 0
         for internal_name, context_info in self._parameter_context_map.items():
-             if context_info.get('sympy_expr'): 
+             if context_info.get('sympy_expr'): # Only if it has a sympy_expr (i.e., was an expression string)
                   try:
                        self._compile_expression(internal_name) 
                        num_compiled += 1
@@ -381,13 +400,13 @@ class ParameterManager:
         definition = self._parameter_context_map[internal_name]['definition']
         expr_str_for_error = definition.expression_str or "<Expression not available>"
         resolved_dependencies = self._parameter_context_map[internal_name].get('dependencies', set())
-
+    				
         allowed_dep_symbol_names = {'freq'}
         for dep_internal_name in resolved_dependencies - {'freq'}:
-             allowed_dep_symbol_names.add(dep_internal_name) 
-             _, _, base_name = self._parse_internal_name(dep_internal_name)
-             allowed_dep_symbol_names.add(base_name) 
-
+                allowed_dep_symbol_names.add(dep_internal_name) 
+                _, _, base_name = self._parse_internal_name(dep_internal_name)
+                allowed_dep_symbol_names.add(base_name) 
+                
         for node in sympy.preorder_traversal(sympy_expr):
             node_type = type(node)
 
@@ -397,7 +416,7 @@ class ParameterManager:
             elif node.is_Atom:
                 if node.is_Function: 
                     if node not in self.ALLOWED_SYMPY_FUNCTIONS: 
-                         if hasattr(node, 'func') and node.func not in self.ALLOWED_SYMPY_FUNCTIONS:
+                        if hasattr(node, 'func') and node.func not in self.ALLOWED_SYMPY_FUNCTIONS:
                             raise ParameterSyntaxError(f"Disallowed function atom '{node}' (func: {node.func.__name__}) in expression for '{internal_name}' ('{expr_str_for_error}').")
                 elif node.is_Symbol:
                     if node in self.ALLOWED_SYMPY_SYMBOLS: continue 
@@ -410,10 +429,13 @@ class ParameterManager:
                         f"Resolved dependencies imply allowed variable names: {allowed_dep_symbol_names}."
                     )
                 elif node.is_Number:
-                    if node.is_finite is False: 
+                    # Check for SymPy's infinity/NaN representations explicitly
+                    if node in (sympy.oo, -sympy.oo, sympy.zoo, sympy.nan): # ADDED THIS CHECK
+                        raise ParameterSyntaxError(f"Disallowed number '{node}' (Infinity/NaN) in expression for '{internal_name}' ('{expr_str_for_error}').")
+                    if node.is_finite is False: # Catches other cases if any
                         raise ParameterSyntaxError(f"Disallowed number '{node}' (Infinity/NaN) in expression for '{internal_name}' ('{expr_str_for_error}').")
                     if not isinstance(node, (Integer, Float, Rational)):
-                        pass
+                        pass # Allow other valid numbers
             elif node.is_Function: 
                 if node.func not in self.ALLOWED_SYMPY_FUNCTIONS:
                     raise ParameterSyntaxError(f"Disallowed function call '{node.func.__name__}' in expression for '{internal_name}' ('{expr_str_for_error}').")
@@ -421,7 +443,15 @@ class ParameterManager:
             elif isinstance(node, (Add, Mul, Pow)):
                 continue 
             else: 
-                raise ParameterSyntaxError(f"Unexpected expression element '{node}' of type '{node_type.__name__}' in expression for '{internal_name}' ('{expr_str_for_error}').")
+                # This case should ideally not be hit if all SymPy expression types are categorized
+                # However, it serves as a fallback to prevent unexpected elements.
+                # Check if it's a known constant like oo, zoo, nan again, as they might not be Atoms.
+                if node in (sympy.oo, -sympy.oo, sympy.zoo, sympy.nan): # ADDED THIS CHECK
+                    raise ParameterSyntaxError(f"Disallowed constant '{node}' (Infinity/NaN) in expression for '{internal_name}' ('{expr_str_for_error}').")
+                
+                # If it's not an explicitly allowed operation or known constant, raise error.
+                # This helps catch things like sympy.Sum, sympy.Product if they slip through.
+                raise ParameterSyntaxError(f"Unexpected expression element '{node}' of type '{node_type.__name__}' in expression for '{internal_name}' ('{expr_str_for_error}'). Review allowed operations and SymPy object types.")
 
     def _compile_expression(self, internal_name: str):
         if internal_name in self._compiled_functions:
@@ -432,7 +462,9 @@ class ParameterManager:
         definition = context_info['definition']
 
         if not sympy_expr: 
-            logger.warning(f"Attempted to compile non-expression parameter '{internal_name}'. Skipping.")
+            # This can happen if is_value_provided was false, or it was a constant string ref.
+            # Only compile if sympy_expr was actually created.
+            logger.debug(f"Skipping compilation for '{internal_name}' as it has no SymPy expression (e.g. constant or no value provided).")
             return
 
         expr_str_for_error = definition.expression_str or "<Expression not available>"
@@ -454,9 +486,7 @@ class ParameterManager:
 
             arg_symbols.sort(key=str)
             final_args_for_lambdify = ([Symbol('freq')] if has_freq else []) + arg_symbols
-
-            #numpy_modules_with_custom = ['numpy', {self._custom_log10_func.__name__: np.log10}]
-
+            
             compiled_func = sympy.lambdify(
                 final_args_for_lambdify,
                 sympy_expr,
@@ -495,32 +525,60 @@ class ParameterManager:
 
     def is_constant(self, internal_name: str) -> bool:
         self._check_build_complete()
+        
+        context_info = self._parameter_context_map.get(internal_name)
+        if not context_info:
+            raise ParameterScopeError(f"Parameter '{internal_name}' not found.")
+        
+        definition = context_info['definition']
+        if not definition.is_value_provided:
+            return False # Cannot be constant if no value was provided from YAML
+
+        # If value was provided, then check if it's in _parsed_constants or has no compiled func
         if internal_name in self._parsed_constants:
             return True
         if internal_name in self._compiled_functions:
             return False 
-        if internal_name in self._parameter_context_map: 
-             definition = self._parameter_context_map[internal_name]['definition']
-             if definition.expression_str: return False 
-             return True
-        raise ParameterScopeError(f"Parameter '{internal_name}' not found.")
+        # If it's in context_map, value was provided, but not an expression and not a direct literal: it's a constant reference
+        # This should have been resolved into _parsed_constants by _resolve_constant_recursive if it's truly constant.
+        # The most reliable check after build is: is it in _parsed_constants (literal or resolved ref)
+        # OR is it a definition that is not an expression (no compiled_func) and has no 'freq' dependency.
+        
+        # More robust check:
+        if 'freq' in context_info.get('dependencies', set()):
+            return False # Depends on frequency
+        
+        # If no 'freq' dependency, check if all its parameter dependencies are themselves constant
+        # This is essentially what _resolve_constant_recursive does.
+        try:
+            self._resolve_constant_recursive(internal_name, set()) # This will attempt to resolve and cache
+            return internal_name in self._parsed_constants # If successful, it's cached
+        except ParameterError: # If it fails to resolve to a constant (e.g. dep is expression)
+            return False
 
 
     def get_constant_value(self, internal_name: str) -> Quantity:
         self._check_build_complete()
+        
+        # First, ensure the parameter definition indicates a value was provided
+        definition = self.get_parameter_definition(internal_name) # Handles not found
+        if not definition.is_value_provided:
+            raise ParameterError(f"Cannot get constant value for parameter '{internal_name}': No value was provided in the netlist YAML.")
+
         if internal_name in self._parsed_constants:
             return self._parsed_constants[internal_name]
 
         if internal_name in self._compiled_functions:
-            definition = self._parameter_context_map[internal_name]['definition']
             raise ParameterError(f"Parameter '{internal_name}' is an expression ('{definition.expression_str}') and cannot be retrieved as a simple constant value. Use resolve_parameter().")
 
         try:
+            # _resolve_constant_recursive will also check is_value_provided for dependencies
             return self._resolve_constant_recursive(internal_name, set())
         except ParameterError as e: 
             raise ParameterError(f"Failed to resolve parameter '{internal_name}' to a constant value: {e}") from e
         except KeyError: 
-            raise ParameterScopeError(f"Parameter '{internal_name}' not found during constant value resolution.")
+            # This path should ideally not be hit if get_parameter_definition succeeded.
+            raise ParameterScopeError(f"Parameter '{internal_name}' not found during constant value resolution (internal error).")
 
 
     def _resolve_constant_recursive(self, internal_name: str, visited: Set[str]) -> Quantity:
@@ -531,31 +589,47 @@ class ParameterManager:
         if internal_name in self._parsed_constants:
             return self._parsed_constants[internal_name]
 
-        if internal_name in self._compiled_functions:
-             definition = self._parameter_context_map[internal_name]['definition']
-             raise ParameterError(f"Parameter '{internal_name}' ('{definition.expression_str}') is an expression, cannot resolve as constant recursively.")
-
         try:
             context_info = self._parameter_context_map[internal_name]
             definition = context_info['definition']
 
+            if not definition.is_value_provided:
+                # This check is crucial for dependencies.
+                raise ParameterError(f"Dependency parameter '{internal_name}' required for constant resolution had no value provided in YAML.")
+
+            if internal_name in self._compiled_functions: # It's an expression
+                 raise ParameterError(f"Parameter '{internal_name}' ('{definition.expression_str}') is an expression, cannot resolve as constant recursively.")
+
             if not definition.constant_value_str: 
-                raise ParameterError(f"Internal logic error: _resolve_constant_recursive called on '{internal_name}' which is neither a literal constant, an expression, nor a reference.")
+                # This means it's not a literal, not an expression, but should be a reference.
+                # However, if is_value_provided is true, constant_value_str should exist for non-expressions.
+                # This indicates an issue if definition.is_value_provided but constant_value_str is None.
+                # The ParameterDefinition __post_init__ should prevent this state if is_value_provided is True.
+                raise ParameterError(f"Internal logic error: _resolve_constant_recursive called on '{internal_name}' which has is_value_provided=True but no constant_value_str and is not an expression.")
 
             dependencies = context_info.get('dependencies', set())
             if 'freq' in dependencies:
                 raise ParameterError(f"Parameter '{internal_name}' depends on 'freq' and cannot be resolved as a simple constant.")
 
-            if not dependencies:
-                raise ParameterError(f"Internal Error: Parameter '{internal_name}' defined as constant ('{definition.constant_value_str}') with no dependencies was not pre-parsed into _parsed_constants.")
+            if not dependencies: # Should have been caught by _parse_and_cache_constants
+                # This implies it's a literal constant that wasn't cached.
+                if definition.constant_value_str: # It must be a literal
+                    try:
+                        val_qty = self._ureg.Quantity(definition.constant_value_str)
+                        self._parsed_constants[internal_name] = val_qty
+                        return val_qty
+                    except Exception as e:
+                         raise ParameterError(f"Failed to parse literal constant '{internal_name}' ('{definition.constant_value_str}') during recursive resolution: {e}") from e
+                else: # Should not happen due to ParameterDefinition post_init
+                    raise ParameterError(f"Internal Error: Parameter '{internal_name}' has no dependencies, no expression, but also no constant_value_str despite is_value_provided=True.")
 
             if len(dependencies) == 1:
                 dep_name = list(dependencies)[0]
                 resolved_dep_quantity = self._resolve_constant_recursive(dep_name, visited.copy()) 
-                self._parsed_constants[internal_name] = resolved_dep_quantity
+                self._parsed_constants[internal_name] = resolved_dep_quantity # Cache result
                 return resolved_dep_quantity
-            else:
-                raise ParameterError(f"Internal Error: Parameter '{internal_name}' defined as constant ('{definition.constant_value_str}') has unexpected multiple dependencies: {dependencies}.")
+            else: # Should not happen for a constant_value_str that is a reference
+                raise ParameterError(f"Internal Error: Parameter '{internal_name}' defined as constant reference ('{definition.constant_value_str}') has unexpected multiple dependencies: {dependencies}.")
 
         except KeyError: 
             raise ParameterScopeError(f"Dependency parameter '{internal_name}' not found during recursive constant resolution.")
@@ -638,6 +712,7 @@ class ParameterManager:
 
         # 3. Handle literal constants and resolvable constant references
         try:
+            # get_constant_value will raise ParameterError if value not provided
             constant_quantity = self.get_constant_value(internal_name)
             logger.debug(f"  '{internal_name}' resolved as constant: {constant_quantity:~P}")
 
@@ -650,7 +725,7 @@ class ParameterManager:
                 raise pint.DimensionalityError(
                     constant_quantity.units, target_units,
                     constant_quantity.dimensionality, target_units.dimensionality,
-                    f"Resolved constant value for '{internal_name}' ({constant_quantity:~P}) is not compatible with target dimension '{target_dimension_str}'"
+                    extra_msg=f"Resolved constant value for '{internal_name}' ({constant_quantity:~P}) is not compatible with target dimension '{target_dimension_str}'"
                 )
 
             final_qty_scalar = constant_quantity.to(target_units)
@@ -658,18 +733,18 @@ class ParameterManager:
             final_qty_magnitude = final_qty_scalar.magnitude
             if isinstance(final_qty_magnitude, (int, float, complex)): 
                 if freq_hz_arr.size > 0: 
-                    broadcasted_magnitude = np.full_like(freq_hz_arr, final_qty_magnitude, dtype=np.result_type(final_qty_magnitude))
+                    broadcasted_magnitude = np.full_like(freq_hz_arr, final_qty_magnitude, dtype=np.result_type(final_qty_magnitude, float)) # ensure complex if needed, or float
                 elif freq_hz_arr.size == 0: 
-                    broadcasted_magnitude = np.array([], dtype=np.result_type(final_qty_magnitude))
-                else: 
-                    broadcasted_magnitude = np.array([final_qty_magnitude], dtype=np.result_type(final_qty_magnitude)) # Should be caught by ndim reshape
+                    broadcasted_magnitude = np.array([], dtype=np.result_type(final_qty_magnitude, float))
+                else: # Should be caught by ndim reshape, fallback for safety.
+                    broadcasted_magnitude = np.array([final_qty_magnitude], dtype=np.result_type(final_qty_magnitude, float))
                 final_qty = Quantity(broadcasted_magnitude, final_qty_scalar.units)
                 logger.debug(f"  Broadcasted constant '{internal_name}' magnitude to match freq_hz_arr shape {freq_hz_arr.shape}.")
             elif isinstance(final_qty_magnitude, np.ndarray) and final_qty_magnitude.shape != freq_hz_arr.shape and freq_hz_arr.size > 0:
                 logger.warning(f"Constant parameter '{internal_name}' unexpectedly yielded an array-like magnitude {final_qty_magnitude.shape} "
                                f"that does not match freq_hz_arr shape {freq_hz_arr.shape}. This might indicate an issue if the constant was expected to be scalar. Using as is.")
-                final_qty = final_qty_scalar
-            else: 
+                final_qty = final_qty_scalar # Use the original array-like Quantity
+            else: # Magnitude is already an array of correct shape, or freq_hz_arr is empty
                 final_qty = final_qty_scalar
 
 
@@ -678,16 +753,24 @@ class ParameterManager:
             return final_qty
 
         except ParameterError as e:
-            if self.get_compiled_function(internal_name) is None:
-                 logger.error(f"  Error resolving '{internal_name}' as constant, and it's not a compiled expression: {e}")
-                 raise 
+            # This exception could be from get_constant_value (e.g. value not provided, or it's an expression)
+            # or from incompatible target_dimension_str for a constant.
+            # If it's an expression, we proceed. If it's truly unresolvable (e.g. no value AND no expression), we error.
+            compiled_func_check = self.get_compiled_function(internal_name)
+            if compiled_func_check is None: # Not an expression
+                # If get_constant_value failed (e.g. no value provided, or circular ref for consts)
+                # AND it's not an expression, then it's an error that should be re-raised.
+                # SemanticValidator should have reported missing values to user.
+                # Here, it means an attempt to *use* an unprovided, non-expression parameter.
+                logger.debug(f"  Parameter '{internal_name}' is not a resolvable constant ({e}) and not a compiled expression. Re-raising.")
+                raise # Re-raise the error from get_constant_value or dimensionality check
             
-            logger.debug(f"  '{internal_name}' is an expression (get_constant_value failed as expected). Proceeding with evaluation.")
+            logger.debug(f"  '{internal_name}' is an expression (get_constant_value failed as expected with: {e}). Proceeding with expression evaluation.")
 
         # 4. If it's an expression, get its compiled function
         compiled_func = self.get_compiled_function(internal_name) 
-        if not compiled_func: 
-            raise ParameterError(f"Internal logic error: Parameter '{internal_name}' has no compiled function despite passing earlier checks.")
+        if not compiled_func: # Should be redundant due to check above, but for safety.
+            raise ParameterError(f"Internal logic error: Parameter '{internal_name}' has no compiled function despite passing earlier checks (is_value_provided={definition.is_value_provided}).")
 
         # 5. Resolve dependencies recursively and prepare arguments for the compiled function
         dependencies_set = context_info.get('dependencies', set()) 
@@ -725,38 +808,28 @@ class ParameterManager:
                 func_args_values.append(freq_hz_arr)
             else:
                 dep_internal_name = None
-                if '.' in arg_name_str: 
-                    if arg_name_str in dependencies_set:
+                # Try to map arg_name_str (from SymPy symbol) back to a full internal name
+                # This logic assumes arg_name_str is either a direct internal name (if it contains '.')
+                # or an unqualified name that needs context (scope, owner) to resolve.
+                if '.' in arg_name_str: # Potentially already fully qualified if from _InstanceProxy
+                    if arg_name_str in dependencies_set and arg_name_str in self._parameter_context_map:
                         dep_internal_name = arg_name_str
-                    elif arg_name_str not in self._parameter_context_map:
-                         raise ParameterScopeError(f"Symbol '{arg_name_str}' from expression for '{internal_name}' appears to be a qualified parameter name "
-                                                  f"but is not defined in the parameter context map.")
-                    else: 
-                        raise ParameterError(f"Internal inconsistency: Qualified symbol '{arg_name_str}' used in expression of '{internal_name}' "
-                                             f"is a defined parameter but was not found in its collected dependencies {dependencies_set}. "
-                                             f"This suggests an issue in dependency parsing during build().")
-                else: 
-                    current_param_scope = definition.scope 
-                    current_param_owner = definition.owner_id
-                    
-                    if current_param_scope == 'instance' and current_param_owner:
-                        potential_inst_dep = f"{current_param_owner}.{arg_name_str}"
-                        if potential_inst_dep in dependencies_set:
-                            dep_internal_name = potential_inst_dep
-                    
-                    if not dep_internal_name:
-                        potential_glob_dep = f"{self.GLOBAL_SCOPE_PREFIX}.{arg_name_str}"
-                        if potential_glob_dep in dependencies_set:
-                            dep_internal_name = potential_glob_dep
-                
-                if not dep_internal_name:
-                    raise ParameterError(
-                        f"Internal inconsistency: Lambdify argument symbol '{arg_name_str}' for parameter '{internal_name}' "
-                        f"(expression: '{definition.expression_str or definition.constant_value_str}') "
-                        f"could not be mapped to a known fully-qualified dependency from the set: {dependencies_set}. "
-                        f"Original free symbols in expression: {[str(s) for s in free_symbols_in_expr]}. "
-                        f"Please check if '{arg_name_str}' is correctly defined or if the expression has unresolved symbols."
-                    )
+                    else: # Should not happen if dependencies were correctly identified
+                        raise ParameterScopeError(f"Symbol '{arg_name_str}' from expression for '{internal_name}' appears to be a qualified parameter name "
+                                                  f"but is not a resolved dependency or not defined. Dependencies: {dependencies_set}")
+                else: # Unqualified symbol, needs resolution based on current parameter's context
+                    try:
+                        dep_internal_name = self._resolve_symbol_to_internal_name(
+                            arg_name_str, definition.scope, definition.owner_id
+                        )
+                        if dep_internal_name not in dependencies_set:
+                             raise ParameterError(f"Internal inconsistency: Resolved dependency '{dep_internal_name}' for symbol '{arg_name_str}' "
+                                                  f"is not in the pre-calculated dependencies set {dependencies_set} for '{internal_name}'.")
+                    except ParameterScopeError as e:
+                        raise ParameterError(f"Failed to map symbol '{arg_name_str}' to internal name for '{internal_name}': {e}") from e
+
+                if not dep_internal_name: # Should be caught by above logic
+                    raise ParameterError(f"Internal inconsistency: Lambdify argument symbol '{arg_name_str}' for parameter '{internal_name}' could not be mapped to a known dependency.")
                 
                 dep_declared_dimension_str = self.get_declared_dimension(dep_internal_name)
                 logger.debug(f"    Recursing for dependency '{dep_internal_name}' (needed by '{internal_name}'), own declared_dim='{dep_declared_dimension_str}'")
@@ -765,36 +838,53 @@ class ParameterManager:
                     dep_internal_name, freq_hz_arr, dep_declared_dimension_str, evaluation_context
                 )
                 
+                # Lambdify expects numerical arrays, not Quantities
                 func_args_values.append(resolved_dep_qty.magnitude)
 
         # 6. Call compiled function
         try:
             arg_shapes_str = [f"{arg.shape if isinstance(arg,np.ndarray) else type(arg)}" for arg in func_args_values]
             logger.debug(f"  Calling compiled func for '{internal_name}' with {len(func_args_values)} args. Shapes/Types: {arg_shapes_str}")
-            numerical_result = compiled_func(*func_args_values)
             
-            if not isinstance(numerical_result, np.ndarray):
+            current_err_settings = np.seterr(all='raise') 
+            numerical_result = compiled_func(*func_args_values)
+            np.seterr(**current_err_settings)
+
+            if isinstance(numerical_result, np.ndarray) and (np.any(np.isnan(numerical_result)) or np.any(np.isinf(numerical_result))):
+                logger.warning(f"Numerical evaluation of '{internal_name}' resulted in NaN/Inf: {numerical_result}")
+            
+            if not isinstance(numerical_result, np.ndarray): # Ensure it's an array
                 numerical_result = np.array(numerical_result) 
             
-            if numerical_result.ndim == 0 and freq_hz_arr.ndim > 0 : # Expression result is scalar, freq context is array
-                if freq_hz_arr.size > 0:
-                    numerical_result = np.full_like(freq_hz_arr, numerical_result.item(), dtype=np.result_type(numerical_result.item() if numerical_result.size > 0 else float))
-                elif freq_hz_arr.size == 0: 
-                     numerical_result = np.array([], dtype=np.result_type(numerical_result.item() if numerical_result.size > 0 else float))
+            # Ensure result matches frequency array shape if it was scalar and freq was array
+            if numerical_result.ndim == 0 and freq_hz_arr.ndim > 0 : 
+                if freq_hz_arr.size > 0: # If freq_hz_arr is not empty
+                    # Use result_type to handle complex numbers correctly if numerical_result is complex
+                    # and ensure the output array is float/complex, not object.
+                    dtype_res = np.result_type(numerical_result.item() if numerical_result.size > 0 else float, float)
+                    numerical_result = np.full_like(freq_hz_arr, numerical_result.item(), dtype=dtype_res)
+                elif freq_hz_arr.size == 0: # If freq_hz_arr is empty, result should be empty
+                    dtype_res = np.result_type(numerical_result.item() if numerical_result.size > 0 else float, float)
+                    numerical_result = np.array([], dtype=dtype_res)
                 logger.debug(f"  Broadcasted scalar expression result for '{internal_name}' to match freq_hz_arr shape {freq_hz_arr.shape}.")
-            elif numerical_result.ndim == 0 and freq_hz_arr.ndim == 1 and freq_hz_arr.size == 1: # both effectively scalar, ensure result is (1,)
-                numerical_result = numerical_result.reshape(1)
+            elif numerical_result.ndim == 0 and freq_hz_arr.ndim == 1 and freq_hz_arr.size == 1: 
+                numerical_result = numerical_result.reshape(1) # Make it (1,) if freq was (1,)
 
 
             logger.debug(f"  Numerical result for '{internal_name}' (shape: {numerical_result.shape}): {numerical_result if numerical_result.size < 5 else str(numerical_result[:5])+'...'}")
-        except Exception as e:
+        
+        except FloatingPointError as fpe: 
+            np.seterr(**current_err_settings) 
             expr_str = definition.expression_str or "<N/A>"
-            arg_details_list = []
-            for i, val in enumerate(func_args_values):
-                arg_symbol_name = str(lambdify_arg_symbols_ordered[i]) if i < len(lambdify_arg_symbols_ordered) else "UNKNOWN_ARG"
-                val_repr = f"shape {val.shape}" if isinstance(val, np.ndarray) else str(val)
-                arg_details_list.append(f"{arg_symbol_name}: {val_repr}")
-            arg_details_str = "; ".join(arg_details_list)
+            arg_details_str = self._format_arg_details_for_error(lambdify_arg_symbols_ordered, func_args_values)
+            raise ParameterError(
+                f"Numerical floating point error during evaluation of '{internal_name}' (expression: '{expr_str}'). "
+                f"Args: [{arg_details_str}]. Error: {type(fpe).__name__} - {fpe}"
+            ) from fpe
+        except Exception as e:
+            np.seterr(**current_err_settings) 
+            expr_str = definition.expression_str or "<N/A>"
+            arg_details_str = self._format_arg_details_for_error(lambdify_arg_symbols_ordered, func_args_values)
 
             raise ParameterError(
                 f"Error evaluating compiled expression for '{internal_name}' (expression: '{expr_str}'). "
@@ -803,19 +893,16 @@ class ParameterManager:
 
         # 7. Create Quantity using the *parameter's own declared dimension first*, then convert to target_dimension_str
         try:
-            # Ensure numerical_result has a compatible type for Quantity if it's empty
             if isinstance(numerical_result, np.ndarray) and numerical_result.size == 0 and not numerical_result.dtype.kind in 'fc':
-                numerical_result = numerical_result.astype(float)
-            # Get the current parameter's (the one internal_name refers to) own declared dimension
-            current_param_declared_dim_str = definition.declared_dimension_str # Or self.get_declared_dimension(internal_name)
-            # Create an intermediate quantity using the parameter's own declared dimension
+                numerical_result = numerical_result.astype(float) # Ensure empty arrays have float/complex type
+            
+            current_param_declared_dim_str = definition.declared_dimension_str
             intermediate_qty = Quantity(numerical_result, current_param_declared_dim_str)
-            # Now, convert this intermediate quantity to the target_dimension_str requested by the caller
             result_qty = intermediate_qty.to(target_dimension_str)
         except (pint.UndefinedUnitError, pint.DimensionalityError, TypeError, ValueError) as e:
             res_shape = numerical_result.shape if isinstance(numerical_result, np.ndarray) else 'scalar'
             res_dtype = numerical_result.dtype if isinstance(numerical_result, np.ndarray) else type(numerical_result)
-            current_param_own_dim = definition.declared_dimension_str # For error message
+            current_param_own_dim = definition.declared_dimension_str 
             raise ParameterError(
                 f"Error processing evaluated result for '{internal_name}'. Numerical result (shape {res_shape}, dtype {res_dtype}) "
                 f"with its declared dimension '{current_param_own_dim}' could not be converted to "
@@ -827,3 +914,12 @@ class ParameterManager:
         val_str = f"{result_qty:~P}" if (isinstance(result_qty.magnitude, np.ndarray) and result_qty.magnitude.size < 5) or not isinstance(result_qty.magnitude, np.ndarray) else f"{str(result_qty.magnitude[:5]) if isinstance(result_qty.magnitude, np.ndarray) else result_qty.magnitude}... {result_qty.units}"
         logger.debug(f"  Successfully resolved expression '{internal_name}' to quantity with target dimension. Value: {val_str}. Cached.")
         return result_qty
+    
+    def _format_arg_details_for_error(self, arg_symbols_ordered, arg_values) -> str:
+							arg_details_list = []
+							for i, val in enumerate(arg_values):
+								arg_symbol_name = str(arg_symbols_ordered[i]) if i < len(arg_symbols_ordered) else "UNKNOWN_ARG"
+								val_repr = f"shape {val.shape}" if isinstance(val, np.ndarray) else str(val)
+								val_short = val_repr[:50] + '...' if len(val_repr) > 50 else val_repr
+								arg_details_list.append(f"{arg_symbol_name}: {val_short}")
+							return "; ".join(arg_details_list)

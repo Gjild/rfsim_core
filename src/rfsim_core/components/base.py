@@ -51,7 +51,7 @@ class ComponentBase(ABC):
         self.instance_id = instance_id
         self.component_type = component_type
         self.parameter_manager = parameter_manager
-        self.parameter_internal_names = parameter_internal_names # Store the names
+        self.parameter_internal_names = parameter_internal_names
         self._ureg = ureg
         logger.debug(f"Initialized {self.component_type} '{self.instance_id}' with param names: {self.parameter_internal_names}")
 
@@ -100,31 +100,33 @@ class ComponentBase(ABC):
              return list(combinations(ports, 2)) # type: ignore
 
     @abstractmethod
-    def get_mna_stamps(self, freq_hz: np.ndarray) -> List[StampInfo]:
+    def get_mna_stamps(self, freq_hz: np.ndarray, resolved_params: Dict[str, Quantity]) -> List[StampInfo]: # MODIFIED SIGNATURE
         """
         Calculates the MNA contribution(s) of the component at the given frequency(ies).
-        *** Implementations MUST return a list of StampInfo tuples. ***
-        *** Each StampInfo contains: (AdmittanceMatrixQuantity, ListOfPortIDs) ***
-        *** AdmittanceMatrixQuantity MUST be a pint.Quantity with [admittance] dimension. ***
-        *** Its magnitude MUST be a complex NumPy array. ***
-        *** ListOfPortIDs must match the order of rows/columns in the AdmittanceMatrixQuantity. ***
-
-        Note: As of Phase 5.1 completion, element implementations contain a TEMPORARY
-              shim using get_constant_value(). This will be replaced by parameter
-              resolution logic in Task 5.4.
+        Implementations use the 'resolved_params' dictionary to get their parameter values as Quantities.
+        The 'freq_hz' argument will be a 1D NumPy array, typically containing a single frequency
+        when called from MnaAssembler.assemble().
+        Magnitudes of Quantities in 'resolved_params' and of 'freq_hz' will typically be 1-element arrays.
+        The returned AdmittanceMatrixQuantity.magnitude should be shaped (num_freqs, N, N),
+        e.g., (1, N, N) if freq_hz is (1,).
 
         Args:
-            freq_hz: NumPy array of frequencies in Hertz (unitless).
+            freq_hz: NumPy array of frequencies in Hertz (unitless). Shape (num_eval_freqs,).
+            resolved_params: Dictionary mapping base parameter names (e.g., "resistance")
+                             to their resolved pint.Quantity objects for the given frequency(ies).
+                             The magnitude of these Quantities will be NumPy arrays, typically
+                             matching the shape of freq_hz.
 
         Returns:
             A list of StampInfo tuples representing the component's contributions.
 
         Raises:
             ComponentError: If calculation fails.
-            TypeError: If freq_hz is not a NumPy array.
+            TypeError: If freq_hz is not a NumPy array or resolved_params is incorrect.
             pint.DimensionalityError: If internal calculations produce wrong dimensions or
-                                     the returned Quantity is not [admittance].
-            ParameterError: If parameter resolution fails (future).
+                                    the returned Quantity is not [admittance].
+            ParameterError: If parameter resolution fails (though most resolution errors
+                            should be caught before this point by MnaAssembler).
         """
         pass
 
@@ -132,7 +134,6 @@ class ComponentBase(ABC):
         return f"{self.component_type}('{self.instance_id}')"
 
     def __repr__(self) -> str:
-        # Represent by showing the internal names it manages
         param_names_str = ", ".join(self.parameter_internal_names)
         return f"{self.component_type}(id='{self.instance_id}', params_managed=[{param_names_str}])"
 

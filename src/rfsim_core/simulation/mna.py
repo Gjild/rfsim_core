@@ -9,6 +9,7 @@ from ..data_structures import Component as ComponentData
 from ..components.base import ComponentBase, ComponentError
 from ..units import ureg, Quantity, pint
 from ..components import LARGE_ADMITTANCE_SIEMENS
+from ..parameters import ParameterManager, ParameterScopeError, ParameterError
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,12 @@ class MnaAssembler:
         # Use the sim_components from the passed-in simulation-ready circuit
         self.sim_components: Dict[str, ComponentBase] = circuit.sim_components
         # Still need raw component data for port->net mapping during stamping
-        self.raw_components: Dict[str, ComponentData] = circuit.components
+        self.raw_components: Dict[str, ComponentData] = circuit.components # For port->net mapping
+
+        # Access ParameterManager from the circuit
+        if not isinstance(circuit.parameter_manager, ParameterManager):
+            raise MnaInputError("Circuit's ParameterManager is not initialized or invalid.")
+        self.parameter_manager: ParameterManager = circuit.parameter_manager
 
         # --- Frequency Independent Setup ---
         self.node_map: Dict[str, int] = {}
@@ -319,10 +325,10 @@ class MnaAssembler:
         if self._cached_rows is None or self._cached_cols is None:
              raise RuntimeError("Sparsity pattern was not computed or is invalid.")
         
-        freq_str = f"{freq_hz:.4e} Hz"
+        freq_str_log = f"{freq_hz:.4e} Hz"
         if freq_hz == 0:
-            freq_str = "0 Hz (DC - component value eval)"
-        logger.debug(f"Assembling MNA matrix for {freq_str} using cached pattern (NNZ={self._sparsity_nnz})...")
+            freq_str_log = "0 Hz (DC - component value eval)"
+        logger.debug(f"Assembling MNA matrix for {freq_str_log} using cached pattern (NNZ={self._sparsity_nnz})...")
 
         # Initialize data array for the current frequency based on cached pattern
         mna_data = np.zeros(self._sparsity_nnz, dtype=np.complex128)
@@ -350,89 +356,129 @@ class MnaAssembler:
                 # If value is effectively zero, we can ignore it silently.
 
         # --- Stamp Simulation Components using Generalized Method ---
-        current_freq_array = np.array([freq_hz]) # Pass frequency as array even if scalar
+        current_freq_array = np.array([freq_hz]) # For parameter resolution and component methods
+        evaluation_context: Dict[Tuple[str, str], Quantity] = {} # Per-frequency memoization cache
+
         for comp_id, sim_comp in self.sim_components.items():
             # Get raw data for port->net lookup
             if comp_id not in self.raw_components:
                 raise MnaInputError(f"Internal Error: Simulation component '{comp_id}' not found in raw component data during assembly.")
             comp_data = self.raw_components[comp_id]
+
+            resolved_params_dict: Dict[str, Quantity] = {}
+            component_param_specs = type(sim_comp).declare_parameters()
+
             try:
-                # Get list of stamp contributions from the component
-                stamp_infos = sim_comp.get_mna_stamps(current_freq_array)
+                for internal_name in sim_comp.parameter_internal_names:
+                    # Extract base_name (e.g., "resistance" from "R1.resistance")
+                    # ParameterManager._parse_internal_name is protected, use simple split
+                    name_parts = internal_name.split('.', 1)
+                    if len(name_parts) != 2:
+                        raise ComponentError(f"Invalid internal parameter name format '{internal_name}' for component '{comp_id}'.")
+                    base_name = name_parts[1]
 
-                # Process each stamp contribution
+                    if base_name not in component_param_specs:
+                        # This would be an internal inconsistency from CircuitBuilder
+                        raise ComponentError(f"Internal Error: Parameter base name '{base_name}' (from internal '{internal_name}') "
+                                             f"not in declared parameters {list(component_param_specs.keys())} for component '{comp_id}' of type '{type(sim_comp).__name__}'.")
+                    
+                    expected_dimension_str = component_param_specs[base_name]
+
+                    # Resolve parameter value
+                    resolved_qty = self.parameter_manager.resolve_parameter(
+                        internal_name,
+                        current_freq_array, # Pass as np.array([current_scalar_freq])
+                        expected_dimension_str, # Target dimension for the result
+                        evaluation_context
+                    )
+
+                    # Final Validation (as per plan, though resolve_parameter should ensure this)
+                    if not resolved_qty.is_compatible_with(expected_dimension_str):
+                        # This error indicates a problem in resolve_parameter or type declaration mismatch
+                        raise pint.DimensionalityError(
+                            resolved_qty.units,
+                            self.ureg.parse_units(expected_dimension_str), # For better error message
+                            extra_msg=(f"for resolved parameter '{internal_name}' of component '{comp_id}'. "
+                                       f"Expected dimension '{expected_dimension_str}', but "
+                                       f"resolve_parameter returned '{resolved_qty.dimensionality}'. "
+                                       f"Value: {resolved_qty:~P}.")
+                        )
+                    
+                    resolved_params_dict[base_name] = resolved_qty
+                
+                # Call component's get_mna_stamps with resolved parameters
+                stamp_infos = sim_comp.get_mna_stamps(current_freq_array, resolved_params_dict)
+
+            except (ParameterError, ParameterScopeError, pint.DimensionalityError) as e:
+                err_msg = f"Failed to resolve/validate parameters for component '{comp_id}' at {freq_str_log}: {e}"
+                logger.error(err_msg, exc_info=True) # Show more detail for param errors
+                raise ComponentError(err_msg) from e
+            except ComponentError: # Catch ComponentErrors raised from above or during get_mna_stamps
+                raise # Re-raise as it already has context
+            except Exception as e: # Catch other unexpected errors during param resolution or get_mna_stamps
+                err_msg = f"Unexpected error processing parameters or getting stamps for component '{comp_id}' at {freq_str_log}: {type(e).__name__} - {e}"
+                logger.error(err_msg, exc_info=True)
+                raise ComponentError(err_msg) from e
+
+            try:
                 for stamp_idx, stamp_info in enumerate(stamp_infos):
-                     admittance_matrix_qty, port_ids = stamp_info
-
-                     # --- Enforce Contract ---
-                     if not isinstance(admittance_matrix_qty, Quantity):
+                    admittance_matrix_qty, port_ids = stamp_info
+                    if not isinstance(admittance_matrix_qty, Quantity):
                          raise TypeError(f"Comp '{comp_id}' stamp {stamp_idx} matrix != Quantity")
-                     if not admittance_matrix_qty.check('siemens'): # Use check for dimension name
-                         raise pint.DimensionalityError(admittance_matrix_qty.units, ureg.siemens, extra_msg=f"Comp '{comp_id}' stamp {stamp_idx} matrix")
+                    if not admittance_matrix_qty.check('siemens'):
+                         raise pint.DimensionalityError(admittance_matrix_qty.units, self.ureg.siemens, extra_msg=f"Comp '{comp_id}' stamp {stamp_idx} matrix")
 
-                     # Extract numerical matrix/array (in Siemens)
-                     # Need to handle scalar freq vs array freq output from component
-                     stamp_values = admittance_matrix_qty.to(ureg.siemens).magnitude
-
-                     if stamp_values.ndim == 3:
-                         if stamp_values.shape[0] == 1:
-                             current_stamp_matrix = stamp_values[0, :, :]
-                         else:
-                             # Should not happen in single freq assembly loop
+                    stamp_values = admittance_matrix_qty.to(self.ureg.siemens).magnitude
+                    current_stamp_matrix: np.ndarray
+                    if stamp_values.ndim == 3:
+                        if stamp_values.shape[0] == 1:
+                            current_stamp_matrix = stamp_values[0, :, :]
+                        else:
                              logger.warning(f"Component '{comp_id}' returned unexpected multi-frequency shape {stamp_values.shape} within single-frequency assembly loop. Using first slice.")
                              current_stamp_matrix = stamp_values[0, :, :]
-                     elif stamp_values.ndim == 2:
-                         current_stamp_matrix = stamp_values
-                     elif stamp_values.ndim == 0 and stamp_values.size == 1 and len(port_ids) == 1:
-                         # Handle scalar stamp for 1-port component case?
-                         current_stamp_matrix = np.array([[stamp_values]]) # Make it 2D (1x1)
-                     else:
+                    elif stamp_values.ndim == 2:
+                        current_stamp_matrix = stamp_values
+                    elif stamp_values.ndim == 0 and stamp_values.size == 1 and len(port_ids) == 1:
+                         current_stamp_matrix = np.array([[stamp_values.item()]])
+                    else:
                          raise ValueError(f"Component '{comp_id}' returned stamp with unexpected dimension/shape {stamp_values.shape} (ndim={stamp_values.ndim}, size={stamp_values.size}). Expected 2D (N,N) or 3D (1,N,N).")
 
-
-                     # Get global node indices (unchanged)
-                     global_indices = []
-                     valid_ports = True
-                     for port_id in port_ids:
-                         port_obj = comp_data.ports.get(port_id)
-                         if not port_obj or not port_obj.net: # Check connection exists
-                             logger.error(f"Component '{comp_id}' stamp {stamp_idx} refers to port ID '{port_id}' which is not connected in the netlist instance. Skipping stamp.")
-                             valid_ports = False
-                             break
-                         net_name = port_obj.net.name
-                         if net_name not in self.node_map:
+                    global_indices = []
+                    valid_ports = True
+                    for port_id in port_ids:
+                        port_obj = comp_data.ports.get(port_id)
+                        if not port_obj or not port_obj.net:
+                            logger.error(f"Component '{comp_id}' stamp {stamp_idx} refers to port ID '{port_id}' which is not connected in the netlist instance. Skipping stamp.")
+                            valid_ports = False
+                            break
+                        net_name = port_obj.net.name
+                        if net_name not in self.node_map:
                              raise MnaInputError(f"Internal Error: Net '{net_name}' from component '{comp_id}' port '{port_id}' not found in node map during assembly.")
-                         global_indices.append(self.node_map[net_name])
-                     if not valid_ports: continue
+                        global_indices.append(self.node_map[net_name])
+                    if not valid_ports: continue
 
-                     # Check dimensions match (unchanged)
-                     num_ports_in_stamp = len(port_ids)
-                     if current_stamp_matrix.shape != (num_ports_in_stamp, num_ports_in_stamp):
+                    num_ports_in_stamp = len(port_ids)
+                    if current_stamp_matrix.shape != (num_ports_in_stamp, num_ports_in_stamp):
                          raise ValueError(f"Component '{comp_id}' stamp {stamp_idx} matrix shape {current_stamp_matrix.shape} mismatch with number of ports {num_ports_in_stamp}.")
 
-                     # Add stamp elements to global MNA data
-                     for i in range(num_ports_in_stamp):
-                         for j in range(num_ports_in_stamp):
-                             global_row = global_indices[i]
-                             global_col = global_indices[j]
-                             stamp_val = current_stamp_matrix[i, j]
-
-                             # Add using the helper (now raises error on sparsity mismatch)
-                             add_value_to_data(global_row, global_col, stamp_val, comp_id)
-
-                     logger.debug(f"Stamped '{comp_id}' contribution {stamp_idx} for ports {port_ids} -> nodes {global_indices}")
-
+                    for i in range(num_ports_in_stamp):
+                        for j in range(num_ports_in_stamp):
+                            global_row = global_indices[i]
+                            global_col = global_indices[j]
+                            stamp_val = current_stamp_matrix[i, j]
+                            add_value_to_data(global_row, global_col, stamp_val, comp_id)
+                    logger.debug(f"Stamped '{comp_id}' contribution {stamp_idx} for ports {port_ids} -> nodes {global_indices}")
+            
             except MnaInputError: raise # Propagate sparsity errors immediately
-            except ComponentError as e: # Catch component-level errors (e.g., bad params during get_stamps)
-                 logger.error(f"Component error during stamp calculation for '{comp_id}' at {freq_str}: {e}", exc_info=True)
-                 raise ComponentError(f"Failed processing component '{comp_id}' stamps at {freq_str}: {e}") from e
+            except ComponentError as e:
+                logger.error(f"Component error during stamp processing for '{comp_id}' at {freq_str_log}: {e}", exc_info=False) # Already logged by component usually
+                raise ComponentError(f"Failed processing component '{comp_id}' stamps at {freq_str_log}: {e}") from e # Re-raise with context
             except Exception as e:
-                logger.error(f"Unexpected failure getting/processing stamps for component '{comp_id}' at {freq_str}: {e}", exc_info=True)
-                raise ComponentError(f"Unexpected failure processing component '{comp_id}' stamps at {freq_str}: {e}") from e
+                logger.error(f"Unexpected failure processing stamps for component '{comp_id}' at {freq_str_log}: {e}", exc_info=True)
+                raise ComponentError(f"Unexpected failure processing component '{comp_id}' stamps at {freq_str_log}: {e}") from e
 
         # --- Create Final Sparse Matrix ---
         try:
-            # Use the cached pattern indices and the computed data
             Yn_full_coo = sp.coo_matrix(
                 (mna_data, (self._cached_rows, self._cached_cols)),
                 shape=self._shape_full,
@@ -440,9 +486,8 @@ class MnaAssembler:
             )
             Yn_full_csc = Yn_full_coo.tocsc()
             Yn_full_csc.eliminate_zeros()
-
-            logger.debug(f"Full MNA matrix assembly complete for {freq_str}. Shape: {Yn_full_csc.shape}, NNZ: {Yn_full_csc.nnz}")
+            logger.debug(f"Full MNA matrix assembly complete for {freq_str_log}. Shape: {Yn_full_csc.shape}, NNZ: {Yn_full_csc.nnz}")
             return Yn_full_csc
         except Exception as e:
-            logger.error(f"Failed to create final sparse matrix at {freq_str}: {e}", exc_info=True)
-            raise RuntimeError(f"Failed creating sparse MNA matrix at {freq_str}: {e}") from e
+            logger.error(f"Failed to create final sparse matrix at {freq_str_log}: {e}", exc_info=True)
+            raise RuntimeError(f"Failed creating sparse MNA matrix at {freq_str_log}: {e}") from e

@@ -1,5 +1,4 @@
 # --- src/rfsim_core/data_structures.py ---
-# (No significant changes needed for Phase 4 fixes, removed frequency_sweep_hz)
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Set, TYPE_CHECKING
@@ -40,6 +39,7 @@ class Port:
     component: 'Component'
     port_id: str | int
     net: Optional[Net] = None
+    original_yaml_net_name: Optional[str] = None # Added for SemanticValidator
 
     def __post_init__(self):
          if not isinstance(self.port_id, (str, int)):

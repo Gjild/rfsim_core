@@ -37,52 +37,51 @@ class Resistor(ComponentBase):
         parameter_internal_names: List[str]
     ):
         super().__init__(instance_id, component_type, parameter_manager, parameter_internal_names)
-        # Parameter validation (e.g., non-negative) might move to get_mna_stamps after resolution
 
-    def get_mna_stamps(self, freq_hz: np.ndarray) -> List[StampInfo]:
-        """Calculates the 2x2 admittance matrix stamp."""
+    def get_mna_stamps(self, freq_hz: np.ndarray, resolved_params: Dict[str, Quantity]) -> List[StampInfo]:
         if not isinstance(freq_hz, np.ndarray):
             raise TypeError(f"{self.instance_id}: freq_hz must be a NumPy array.")
+        if not isinstance(resolved_params, dict):
+            raise TypeError(f"{self.instance_id}: resolved_params must be a dictionary.")
 
-        # --- TEMPORARY SHIM for Task 5.1 completion ---
-        # Assumes 'resistance' is defined as a constant for now.
-        # This will be replaced by resolve_parameter in Task 5.4.
-        resistance_internal_name = f"{self.instance_id}.resistance"
         try:
-            # Use get_constant_value which was populated during PM build
-            resistance = self.parameter_manager.get_constant_value(resistance_internal_name)
-        except ParameterError as e:
-            raise ComponentError(f"Failed to get constant resistance for {self.instance_id}: {e}. Is it defined as an expression?") from e
+            resistance_qty = resolved_params['resistance']
         except KeyError:
-             raise ComponentError(f"Internal Error: Constant resistance '{resistance_internal_name}' not found for {self.instance_id}.")
+            # This should ideally not happen if CircuitBuilder ensures all declared params are resolved.
+            raise ComponentError(f"Parameter 'resistance' not found in resolved_params for {self.instance_id}. Available: {list(resolved_params.keys())}")
 
-        # Validate value *after* retrieval (optional, could wait for expression support)
-        if not np.isreal(resistance.magnitude) or resistance.magnitude < 0:
-            raise ComponentError(f"Resistance must be real and non-negative for {self.instance_id}. Got {resistance:~P}")
-        if resistance.magnitude == 0:
+        # resistance_qty.magnitude is expected to be a NumPy array, e.g., shape (1,) if freq_hz is (1,)
+        # We need the scalar resistance value for the current frequency point(s).
+        # If freq_hz (and thus resistance_qty.magnitude) has shape (1,), then resistance_qty[0] gives a scalar Quantity.
+        
+        # Assuming freq_hz (and therefore resistance_qty.magnitude) is shape (1,) here,
+        # as MnaAssembler.assemble calls with freq_hz = np.array([current_scalar_freq])
+        if resistance_qty.magnitude.shape[0] != 1 :
+             logger.warning(f"{self.instance_id}: Resistance quantity magnitude shape {resistance_qty.magnitude.shape} unexpected, expected (1,). Using first element.")
+        
+        current_R_qty_scalar = resistance_qty[0] # Get Quantity for the single frequency point
+
+        if not np.isreal(current_R_qty_scalar.magnitude) or current_R_qty_scalar.magnitude < 0:
+            raise ComponentError(f"Resistance must be real and non-negative for {self.instance_id}. Got {current_R_qty_scalar:~P}")
+        
+        if current_R_qty_scalar.magnitude == 0:
             logger.warning(f"Component '{self.instance_id}' has zero resistance. Treated as ideal short (large finite admittance) for F>0 analysis.")
-        # --- End Temporary Shim ---
-
-        R_mag = resistance.magnitude
-
-        if R_mag == 0:
-            y_val = LARGE_ADMITTANCE_SIEMENS + 0j
+            y_scalar_complex = LARGE_ADMITTANCE_SIEMENS + 0j
         else:
-            y_scalar_qty = (1.0 / resistance).to(ureg.siemens)
-            y_val = complex(y_scalar_qty.magnitude)
+            admittance_scalar_qty = (1.0 / current_R_qty_scalar).to(ureg.siemens)
+            y_scalar_complex = complex(admittance_scalar_qty.magnitude)
 
-        num_freqs = len(freq_hz) if freq_hz.ndim > 0 and freq_hz.size > 0 else 1
-        if num_freqs > 1:
-             stamp_mag = np.zeros((num_freqs, 2, 2), dtype=np.complex128)
-             stamp_mag[:, 0, 0] = y_val
-             stamp_mag[:, 0, 1] = -y_val
-             stamp_mag[:, 1, 0] = -y_val
-             stamp_mag[:, 1, 1] = y_val
-        elif num_freqs == 1 and freq_hz.size > 0:
-            stamp_mag = np.array([[y_val, -y_val], [-y_val, y_val]], dtype=np.complex128)
-        else:
-             stamp_mag = np.empty((0, 2, 2), dtype=np.complex128)
-
+        # y_val_array should contain the admittance for each frequency in freq_hz.
+        # Since freq_hz is (1,) here, y_val_array will be (1,).
+        y_val_array = np.array([y_scalar_complex], dtype=np.complex128)
+        
+        num_freqs_in_stamp = y_val_array.shape[0] # Should be 1
+        stamp_mag = np.zeros((num_freqs_in_stamp, 2, 2), dtype=np.complex128)
+        stamp_mag[:, 0, 0] = y_val_array
+        stamp_mag[:, 0, 1] = -y_val_array
+        stamp_mag[:, 1, 0] = -y_val_array
+        stamp_mag[:, 1, 1] = y_val_array
+        
         admittance_matrix_qty = Quantity(stamp_mag, ureg.siemens)
         return [(admittance_matrix_qty, [PORT_1, PORT_2])]
 
@@ -108,59 +107,46 @@ class Capacitor(ComponentBase):
         parameter_internal_names: List[str]
     ):
         super().__init__(instance_id, component_type, parameter_manager, parameter_internal_names)
-        # No longer store self.capacitance
 
-    def get_mna_stamps(self, freq_hz: np.ndarray) -> List[StampInfo]:
+    def get_mna_stamps(self, freq_hz: np.ndarray, resolved_params: Dict[str, Quantity]) -> List[StampInfo]:
         if not isinstance(freq_hz, np.ndarray):
              raise TypeError(f"{self.instance_id}: freq_hz must be a NumPy array.")
+        if not isinstance(resolved_params, dict):
+            raise TypeError(f"{self.instance_id}: resolved_params must be a dictionary.")
 
-        # --- TEMPORARY SHIM ---
-        capacitance_internal_name = f"{self.instance_id}.capacitance"
         try:
-            capacitance = self.parameter_manager.get_constant_value(capacitance_internal_name)
-        except ParameterError as e:
-            raise ComponentError(f"Failed to get constant capacitance for {self.instance_id}: {e}. Is it defined as an expression?") from e
+            capacitance_qty = resolved_params['capacitance'] # Magnitude is shape (1,)
         except KeyError:
-             raise ComponentError(f"Internal Error: Constant capacitance '{capacitance_internal_name}' not found for {self.instance_id}.")
+            raise ComponentError(f"Parameter 'capacitance' not found in resolved_params for {self.instance_id}.")
 
-        # Validate
-        if not np.isreal(capacitance.magnitude) or capacitance.magnitude < 0:
-             if not np.isinf(capacitance.magnitude):
-                 raise ComponentError(f"Capacitance must be real and non-negative (or infinite) for {self.instance_id}. Got {capacitance:~P}")
-        if np.isinf(capacitance.magnitude):
-            logger.warning(f"Component '{self.instance_id}' has infinite capacitance. Treated as ideal short (large finite admittance) for F>0 analysis.")
-        # --- End Shim ---
-
-        C_mag = capacitance.magnitude
-        y_val_array: np.ndarray
-        is_dc = (freq_hz == 0)
-        is_infinite_cap = np.isinf(C_mag)
-
+        # Validate (using the scalar value for the current frequency)
+        current_C_scalar_mag = capacitance_qty.magnitude[0]
+        if not np.isreal(current_C_scalar_mag) or current_C_scalar_mag < 0:
+             if not np.isinf(current_C_scalar_mag):
+                 raise ComponentError(f"Capacitance must be real and non-negative (or infinite) for {self.instance_id}. Got {capacitance_qty[0]:~P}")
+        
+        is_infinite_cap = np.isinf(current_C_scalar_mag)
         if is_infinite_cap:
-            y_scalar = LARGE_ADMITTANCE_SIEMENS + 0j
-            y_val_array = np.full_like(freq_hz, y_scalar, dtype=np.complex128)
+            logger.warning(f"Component '{self.instance_id}' has infinite capacitance. Treated as ideal short (large finite admittance) for F>0 analysis.")
+            y_val_array = np.array([LARGE_ADMITTANCE_SIEMENS + 0j], dtype=np.complex128)
         else:
-            omega = (2 * np.pi * freq_hz) * (ureg.rad / ureg.second)
-            y_qty = (1j * omega * capacitance).to(ureg.siemens) # Use retrieved capacitance
-            y_val_array_temp = np.asarray(y_qty.magnitude, dtype=np.complex128)
-            if np.any(is_dc):
-                y_val_array = np.where(is_dc, 0.0 + 0.0j, y_val_array_temp)
-            else:
-                y_val_array = y_val_array_temp
+            # freq_hz is (1,), capacitance_qty.magnitude is (1,)
+            # Pint handles element-wise operations for Quantities with array magnitudes.
+            omega = (2 * np.pi * freq_hz) * (ureg.rad / ureg.second) # omega.magnitude is (1,)
+            admittance_qty = (1j * omega * capacitance_qty).to(ureg.siemens) # admittance_qty.magnitude is (1,)
+            y_val_array_temp = np.asarray(admittance_qty.magnitude, dtype=np.complex128) # Shape (1,)
+            
+            # DC handling: freq_hz is np.array([f_scalar])
+            is_dc_array = (freq_hz == 0) # is_dc_array is np.array([True/False]), shape (1,)
+            y_val_array = np.where(is_dc_array, 0.0 + 0.0j, y_val_array_temp) # Shape (1,)
 
-        if y_val_array.ndim > 0 and y_val_array.size > 0:
-            num_freqs = len(y_val_array)
-            stamp_mag = np.zeros((num_freqs, 2, 2), dtype=np.complex128)
-            stamp_mag[:, 0, 0] = y_val_array
-            stamp_mag[:, 0, 1] = -y_val_array
-            stamp_mag[:, 1, 0] = -y_val_array
-            stamp_mag[:, 1, 1] = y_val_array
-        elif y_val_array.ndim == 0 and y_val_array.size == 1:
-             y_scalar = complex(y_val_array)
-             stamp_mag = np.array([[y_scalar, -y_scalar], [-y_scalar, y_scalar]], dtype=np.complex128)
-        else:
-             stamp_mag = np.empty((0, 2, 2), dtype=np.complex128)
-
+        num_freqs_in_stamp = y_val_array.shape[0] # Should be 1
+        stamp_mag = np.zeros((num_freqs_in_stamp, 2, 2), dtype=np.complex128)
+        stamp_mag[:, 0, 0] = y_val_array
+        stamp_mag[:, 0, 1] = -y_val_array
+        stamp_mag[:, 1, 0] = -y_val_array
+        stamp_mag[:, 1, 1] = y_val_array
+        
         admittance_matrix_qty = Quantity(stamp_mag, ureg.siemens)
         return [(admittance_matrix_qty, [PORT_1, PORT_2])]
 
@@ -186,63 +172,52 @@ class Inductor(ComponentBase):
         parameter_internal_names: List[str]
     ):
         super().__init__(instance_id, component_type, parameter_manager, parameter_internal_names)
-        # No longer store self.inductance
 
-    def get_mna_stamps(self, freq_hz: np.ndarray) -> List[StampInfo]:
+    def get_mna_stamps(self, freq_hz: np.ndarray, resolved_params: Dict[str, Quantity]) -> List[StampInfo]:
         if not isinstance(freq_hz, np.ndarray):
              raise TypeError(f"{self.instance_id}: freq_hz must be a NumPy array.")
-
-        # --- TEMPORARY SHIM ---
-        inductance_internal_name = f"{self.instance_id}.inductance"
+        if not isinstance(resolved_params, dict):
+            raise TypeError(f"{self.instance_id}: resolved_params must be a dictionary.")
+        
         try:
-            inductance = self.parameter_manager.get_constant_value(inductance_internal_name)
-        except ParameterError as e:
-            raise ComponentError(f"Failed to get constant inductance for {self.instance_id}: {e}. Is it defined as an expression?") from e
+            inductance_qty = resolved_params['inductance'] # Magnitude is shape (1,)
         except KeyError:
-             raise ComponentError(f"Internal Error: Constant inductance '{inductance_internal_name}' not found for {self.instance_id}.")
+            raise ComponentError(f"Parameter 'inductance' not found in resolved_params for {self.instance_id}.")
 
-        # Validate
-        if not np.isreal(inductance.magnitude) or inductance.magnitude < 0:
-             raise ComponentError(f"Inductance must be real and non-negative for {self.instance_id}. Got {inductance:~P}")
-        if inductance.magnitude == 0:
-             logger.warning(f"Component '{self.instance_id}' has zero inductance. Treated as ideal short (large finite admittance) for F>=0 analysis.")
-        # --- End Shim ---
-
-        L_mag = inductance.magnitude
-        y_val_array: np.ndarray
-        is_dc = (freq_hz == 0)
-        is_zero_inductance = (L_mag == 0)
-
+        current_L_scalar_mag = inductance_qty.magnitude[0]
+        if not np.isreal(current_L_scalar_mag) or current_L_scalar_mag < 0:
+             raise ComponentError(f"Inductance must be real and non-negative for {self.instance_id}. Got {inductance_qty[0]:~P}")
+        
+        is_zero_inductance = (current_L_scalar_mag == 0)
         if is_zero_inductance:
-            y_scalar = LARGE_ADMITTANCE_SIEMENS + 0j
-            y_val_array = np.full_like(freq_hz, y_scalar, dtype=np.complex128)
+             logger.warning(f"Component '{self.instance_id}' has zero inductance. Treated as ideal short (large finite admittance) for F>=0 analysis.")
+             y_val_array = np.array([LARGE_ADMITTANCE_SIEMENS + 0j], dtype=np.complex128)
         else:
-             omega = (2 * np.pi * freq_hz) * (ureg.rad / ureg.second)
-             impedance = (1j * omega * inductance) # Use retrieved inductance
+            omega = (2 * np.pi * freq_hz) * (ureg.rad / ureg.second) # omega.magnitude is (1,)
+            impedance_qty = (1j * omega * inductance_qty) # impedance_qty.magnitude is (1,)
+            
+            # Handle division by zero for DC case (impedance is zero)
+            # Pint's 1.0 / impedance_qty might handle units correctly.
+            # We need to be careful with magnitudes.
+            # impedance_qty.magnitude will be array like [0j] at DC.
+            
+            y_val_list = []
+            for i in range(freq_hz.shape[0]): # Loop over frequencies (here, just 1)
+                imp_scalar_qty_for_freq_i = impedance_qty[i]
+                if np.abs(imp_scalar_qty_for_freq_i.magnitude) < 1e-18: # Effectively zero impedance (DC or L=0 at AC)
+                    y_val_list.append(LARGE_ADMITTANCE_SIEMENS + 0j)
+                else:
+                    adm_scalar_qty_for_freq_i = (1.0 / imp_scalar_qty_for_freq_i).to(ureg.siemens)
+                    y_val_list.append(adm_scalar_qty_for_freq_i.magnitude)
+            
+            y_val_array = np.array(y_val_list, dtype=np.complex128) # Shape (1,)
 
-             with np.errstate(divide='ignore', invalid='ignore'):
-                 y_qty = (1.0 / impedance).to(ureg.siemens)
-                 y_val_array_temp = np.asarray(y_qty.magnitude, dtype=np.complex128)
-
-             if np.any(is_dc):
-                 y_scalar_dc = LARGE_ADMITTANCE_SIEMENS + 0j
-                 y_val_array = np.where(is_dc, y_scalar_dc, y_val_array_temp)
-                 y_val_array = np.nan_to_num(y_val_array, nan=y_scalar_dc, posinf=y_scalar_dc, neginf=y_scalar_dc)
-             else:
-                 y_val_array = y_val_array_temp
-
-        if y_val_array.ndim > 0 and y_val_array.size > 0:
-            num_freqs = len(y_val_array)
-            stamp_mag = np.zeros((num_freqs, 2, 2), dtype=np.complex128)
-            stamp_mag[:, 0, 0] = y_val_array
-            stamp_mag[:, 0, 1] = -y_val_array
-            stamp_mag[:, 1, 0] = -y_val_array
-            stamp_mag[:, 1, 1] = y_val_array
-        elif y_val_array.ndim == 0 and y_val_array.size == 1:
-             y_scalar = complex(y_val_array)
-             stamp_mag = np.array([[y_scalar, -y_scalar], [-y_scalar, y_scalar]], dtype=np.complex128)
-        else:
-             stamp_mag = np.empty((0, 2, 2), dtype=np.complex128)
-
+        num_freqs_in_stamp = y_val_array.shape[0] # Should be 1
+        stamp_mag = np.zeros((num_freqs_in_stamp, 2, 2), dtype=np.complex128)
+        stamp_mag[:, 0, 0] = y_val_array
+        stamp_mag[:, 0, 1] = -y_val_array
+        stamp_mag[:, 1, 0] = -y_val_array
+        stamp_mag[:, 1, 1] = y_val_array
+        
         admittance_matrix_qty = Quantity(stamp_mag, ureg.siemens)
         return [(admittance_matrix_qty, [PORT_1, PORT_2])]

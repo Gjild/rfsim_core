@@ -1,3 +1,4 @@
+# --- src/rfsim_core/__init__.py ---
 import logging
 from .log_config import setup_logging
 
@@ -16,9 +17,17 @@ from .components import (
     Inductor,
     COMPONENT_REGISTRY,
     ComponentError,
-    LARGE_ADMITTANCE_SIEMENS # Expose the constant
+    LARGE_ADMITTANCE_SIEMENS 
 )
 from .circuit_builder import CircuitBuilder, CircuitBuildError
+# Import new validation classes
+from .validation import (
+    SemanticValidator, 
+    SemanticValidationError, 
+    ValidationIssue, 
+    ValidationIssueLevel,
+    SemanticIssueCode
+)
 from .simulation import (
     SimulationError, MnaInputError, SingularMatrixError,
     run_sweep, run_simulation
@@ -39,6 +48,9 @@ __all__ = [
     "COMPONENT_REGISTRY", "ComponentError", "LARGE_ADMITTANCE_SIEMENS",
     # Builder
     "CircuitBuilder", "CircuitBuildError",
+    # Validation
+    "SemanticValidator", "SemanticValidationError", "ValidationIssue", 
+    "ValidationIssueLevel", "SemanticIssueCode",
     # Simulation
     "SimulationError", "MnaInputError", "SingularMatrixError",
     "run_sweep", "run_simulation"

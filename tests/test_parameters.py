@@ -783,20 +783,42 @@ class TestParameterManagerResolveParameter:
 
     def test_resolve_error_numerical_in_expression(self, comprehensive_built_pm):
         pm = comprehensive_built_pm
-        freq = np.array([1e9]) # Value doesn't matter here
+        freq = np.array([1e9]) 
         context = {}
-        # global.Div_by_zero_expr = '1/0'
-        with pytest.raises(ParameterError, match="Parameter 'global.Div_by_zero_expr' not found in context map during resolution."):
-            # The underlying error from numpy/lambdify might be ZeroDivisionError or similar
-            # The wrapper ParameterError should catch it.
-            pm.resolve_parameter("global.Div_by_zero_expr", freq, "dimensionless", context)
+        
+        # Test for 'global.Div_by_zero_expr' which should fail during ParameterManager.build()
+        # So, we can't resolve it here. This part of the test needs to reflect that.
+        # This part of the original test is now invalid because '1/0' should be caught at build time.
+        # We'll test it by trying to build a PM with it separately.
+        temp_pm_div_zero = ParameterManager()
+        div_zero_defs = create_defs([
+            {'name': 'Div_by_zero_expr', 'scope': 'global', 'expression': '1/0', 'dimension': 'dimensionless'},
+        ])
+        temp_pm_div_zero.add_definitions(div_zero_defs)
+        with pytest.raises(ParameterError, match="Parameter build failed due to expression validation/compilation errors"):
+            temp_pm_div_zero.build()
 
+
+        # Test for 'global.Div_by_freq_expr' = '1/freq'
         freq_zero = np.array([0.0])
         context_f0 = {}
-        q_div_by_freq = pm.resolve_parameter("global.Div_by_freq_expr", freq_zero, "siemens", context_f0)
-        assert isinstance(q_div_by_freq, Quantity)
-        assert np.isinf(q_div_by_freq.magnitude).all() # Check that the result is infinity
-        assert q_div_by_freq.check("[conductance]") # siemens is [conductance]
+        with pytest.raises(ParameterError) as excinfo:
+            pm.resolve_parameter("global.Div_by_freq_expr", freq_zero, "siemens", context_f0)
+        
+        assert "Numerical floating point error during evaluation" in str(excinfo.value) or \
+               "division by zero" in str(excinfo.value).lower()
+        assert "global.Div_by_freq_expr" in str(excinfo.value)
+        assert "1/freq" in str(excinfo.value) # Check expression is in error
+
+        # Test that it works for non-zero frequency
+        freq_ok = np.array([1e9])
+        context_ok = {}
+        try:
+            q_ok = pm.resolve_parameter("global.Div_by_freq_expr", freq_ok, "siemens", context_ok)
+            assert isinstance(q_ok, Quantity)
+            assert np.isclose(q_ok.magnitude, 1e-9)
+        except ParameterError:
+            pytest.fail("resolve_parameter failed for Div_by_freq_expr with non-zero frequency.")
 
     def test_resolve_error_bad_target_dimension_str_for_quantity(self, comprehensive_built_pm):
         pm = comprehensive_built_pm
