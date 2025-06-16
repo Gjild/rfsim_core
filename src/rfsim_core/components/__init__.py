@@ -1,12 +1,18 @@
-# --- src/rfsim_core/components/__init__.py ---
+# --- Modify: src/rfsim_core/components/__init__.py ---
 import logging
 logger = logging.getLogger(__name__)
 
 # Import base first to define registry and decorator
-from .base import ComponentBase, COMPONENT_REGISTRY, register_component, ComponentError, LARGE_ADMITTANCE_SIEMENS
+from .base import (
+    ComponentBase, COMPONENT_REGISTRY, register_component, ComponentError,
+    DCBehaviorType
+)
 
 # Import concrete elements to trigger registration
 from .elements import Resistor, Capacitor, Inductor
+
+# --- Import constants if needed directly from components namespace (Optional) ---
+# from ..constants import LARGE_ADMITTANCE_SIEMENS # Keep this commented unless explicitly desired
 
 logger.info(f"Available component types: {list(COMPONENT_REGISTRY.keys())}")
 
@@ -18,5 +24,5 @@ __all__ = [
     "Capacitor",
     "Inductor",
     "ComponentError",
-    "LARGE_ADMITTANCE_SIEMENS",
+    "DCBehaviorType",
 ]

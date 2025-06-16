@@ -1,12 +1,12 @@
 import pytest
 import numpy as np
 
-from rfsim_core.parser import NetlistParser
-from rfsim_core.circuit_builder import CircuitBuilder, CircuitBuildError
-from rfsim_core.data_structures import Circuit, Component
-from rfsim_core.parameters import ParameterManager, ParameterError, ParameterDefinitionError, CircularParameterDependencyError
-from rfsim_core.components import Resistor, Capacitor, Inductor # Import concrete types
-from rfsim_core.units import ureg, Quantity, pint
+from src.rfsim_core.parser import NetlistParser
+from src.rfsim_core.circuit_builder import CircuitBuilder, CircuitBuildError
+from src.rfsim_core.data_structures import Circuit, Component
+from src.rfsim_core.parameters import ParameterManager, ParameterError, ParameterDefinitionError, CircularParameterDependencyError
+from src.rfsim_core.components import Resistor, Capacitor, Inductor
+from src.rfsim_core.units import ureg, Quantity, pint
 
 # --- Fixtures for Parsed Circuit Objects ---
 # Simulate the output of NetlistParser.parse()
@@ -99,7 +99,7 @@ def parsed_circuit_interdependent() -> Circuit:
     ))
     circuit.add_component(Component(
         instance_id="R2", component_type="Resistor",
-        parameters={ # R2 depends on R1.resistance and global.mult
+        parameters={ # R2 depends on R1.resistance and _rfsim_global_.mult
             "resistance": {
                 "expression": "R1.resistance * mult",
                 "dimension": "ohm"
@@ -145,7 +145,7 @@ def parsed_circuit_bad_ports() -> Circuit:
     # Try connecting a port ID that Resistor doesn't declare
     bad_port_id = 'bad_port'
     # Need to manually add to comp.ports dict for builder to see it
-    from rfsim_core.data_structures import Port
+    from src.rfsim_core.data_structures import Port
     comp.ports[bad_port_id] = Port(component=comp, port_id=bad_port_id, net=net1)
     comp.ports[1] = Port(component=comp, port_id=1, net=gnd) # Valid port
     return circuit
@@ -166,13 +166,13 @@ class TestCircuitBuilder:
         pm = sim_circuit.parameter_manager
 
         # Check parameter manager state
-        assert "global.L_global" in pm.get_all_internal_names()
+        assert "_rfsim_global_.L_global" in pm.get_all_internal_names()
         assert "R1.resistance" in pm.get_all_internal_names()
         assert "L1.inductance" in pm.get_all_internal_names()
-        assert pm.is_constant("global.L_global")
+        assert pm.is_constant("_rfsim_global_.L_global")
         assert pm.is_constant("R1.resistance")
         assert pm.is_constant("L1.inductance")
-        assert pm.get_constant_value("global.L_global") == ureg.Quantity("1 nH")
+        assert pm.get_constant_value("_rfsim_global_.L_global") == ureg.Quantity("1 nH")
         assert pm.get_constant_value("R1.resistance") == ureg.Quantity("50 ohm")
         # L1 references L_global, it should also be treated as constant after PM build resolves this link conceptually
         assert pm.get_constant_value("L1.inductance") == ureg.Quantity("1 nH")
@@ -199,16 +199,16 @@ class TestCircuitBuilder:
         sim_circuit = builder.build_circuit(parsed_circuit_global_expr)
         pm = sim_circuit.parameter_manager
 
-        assert "global.R_base" in pm.get_all_internal_names()
-        assert "global.gain" in pm.get_all_internal_names()
+        assert "_rfsim_global_.R_base" in pm.get_all_internal_names()
+        assert "_rfsim_global_.gain" in pm.get_all_internal_names()
         assert "R1.resistance" in pm.get_all_internal_names()
 
-        assert pm.is_constant("global.R_base")
-        assert not pm.is_constant("global.gain")
+        assert pm.is_constant("_rfsim_global_.R_base")
+        assert not pm.is_constant("_rfsim_global_.gain")
         assert pm.is_constant("R1.resistance") # References a constant
 
-        assert pm.get_dependencies("global.gain") == {"global.R_base"} # Sympy parsing might simplify unit away if not careful
-        assert pm.get_declared_dimension("global.gain") == "dimensionless" # dimensionless
+        assert pm.get_dependencies("_rfsim_global_.gain") == {"_rfsim_global_.R_base"} # Sympy parsing might simplify unit away if not careful
+        assert pm.get_declared_dimension("_rfsim_global_.gain") == "dimensionless" # dimensionless
 
         assert "R1" in sim_circuit.sim_components
         r1_sim = sim_circuit.sim_components["R1"]
@@ -221,15 +221,15 @@ class TestCircuitBuilder:
         sim_circuit = builder.build_circuit(parsed_circuit_instance_expr)
         pm = sim_circuit.parameter_manager
 
-        assert "global.R_load" in pm.get_all_internal_names()
+        assert "_rfsim_global_.R_load" in pm.get_all_internal_names()
         assert "R1.resistance" in pm.get_all_internal_names()
         assert "R2.resistance" in pm.get_all_internal_names()
 
-        assert pm.is_constant("global.R_load")
+        assert pm.is_constant("_rfsim_global_.R_load")
         assert not pm.is_constant("R1.resistance") # Defined by expr
         assert pm.is_constant("R2.resistance")    # References constant
 
-        assert pm.get_dependencies("R1.resistance") == {"global.R_load"}
+        assert pm.get_dependencies("R1.resistance") == {"_rfsim_global_.R_load"}
         assert pm.get_declared_dimension("R1.resistance") == "ohm" # ohm
 
         assert "R1" in sim_circuit.sim_components
@@ -248,7 +248,7 @@ class TestCircuitBuilder:
         sim_circuit = builder.build_circuit(parsed_circuit_interdependent)
         pm = sim_circuit.parameter_manager
 
-        assert "global.mult" in pm.get_all_internal_names()
+        assert "_rfsim_global_.mult" in pm.get_all_internal_names()
         assert "R1.resistance" in pm.get_all_internal_names()
         assert "R2.resistance" in pm.get_all_internal_names()
 
@@ -256,8 +256,8 @@ class TestCircuitBuilder:
         assert not pm.is_constant("R2.resistance")
 
         # Check dependency of R2.resistance
-        # Should depend on R1.resistance and global.mult
-        assert pm.get_dependencies("R2.resistance") == {"R1.resistance", "global.mult"}
+        # Should depend on R1.resistance and _rfsim_global_.mult
+        assert pm.get_dependencies("R2.resistance") == {"R1.resistance", "_rfsim_global_.mult"}
 
         assert "R1" in sim_circuit.sim_components
         assert "R2" in sim_circuit.sim_components

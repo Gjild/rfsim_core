@@ -3,14 +3,16 @@ import pytest
 import numpy as np
 import scipy.sparse as sp
 
-from rfsim_core.parser import NetlistParser
-from rfsim_core.circuit_builder import CircuitBuilder, CircuitBuildError
-from rfsim_core.data_structures import Circuit, Component as RawComponentData
-from rfsim_core.parameters import ParameterManager, ParameterError, ParameterDefinitionError
-from rfsim_core.components import Resistor, Capacitor, Inductor, ComponentError
-from rfsim_core.units import ureg, Quantity, pint
-from rfsim_core.simulation.mna import MnaAssembler, MnaInputError
-from rfsim_core.simulation.execution import run_sweep # For higher-level integration tests
+from src.rfsim_core.parser import NetlistParser
+from src.rfsim_core.circuit_builder import CircuitBuilder, CircuitBuildError
+from src.rfsim_core.data_structures import Circuit, Component as RawComponentData
+from src.rfsim_core.parameters import ParameterManager, ParameterError, ParameterDefinitionError
+from src.rfsim_core.components import Resistor, Capacitor, Inductor, ComponentError, COMPONENT_REGISTRY 
+from src.rfsim_core.units import ureg, Quantity, pint
+from src.rfsim_core.simulation.mna import MnaAssembler, MnaInputError
+from src.rfsim_core.simulation.execution import run_sweep # For higher-level integration tests
+from src.rfsim_core.components.base import ComponentBase, register_component, DCBehaviorType
+import pint # For pint.DimensionalityError
 
 # --- Helper to create a simple parsed circuit for builder input ---
 def create_parsed_circuit_for_mna_tests(
@@ -204,7 +206,7 @@ class TestMnaAssemblerWithExpressions:
         with pytest.raises(ComponentError) as excinfo: # This should now be caught
             assembler.assemble(freq_bad_hz)
         
-        assert "Failed to resolve/validate parameters for component 'R1'" in str(excinfo.value)
+        assert "Param resolution/validation failed for 'R1'" in str(excinfo.value)
         assert isinstance(excinfo.value.__cause__, ParameterError) # Check wrapped error
         # Check that the ParameterError mentions the numerical issue
         assert "Numerical floating point error during evaluation" in str(excinfo.value.__cause__) or \
@@ -271,7 +273,8 @@ class TestRunSweepWithExpressions:
         freq_array_hz = np.array([1e9, 2e9]) # Two frequency points
         
         try:
-            _, y_matrices = run_sweep(circuit, freq_array_hz)
+            # Correctly unpack three return values
+            _, y_matrices, _dc_results = run_sweep(circuit, freq_array_hz)
         except Exception as e:
             pytest.fail(f"run_sweep failed unexpectedly: {e}")
 
@@ -299,7 +302,8 @@ class TestRunSweepWithExpressions:
         freq_array_hz = np.array([1e9, 2e9])
 
         try:
-            _, y_matrices = run_sweep(circuit, freq_array_hz)
+            # Correctly unpack three return values
+            _, y_matrices, _dc_results = run_sweep(circuit, freq_array_hz)
         except Exception as e:
             pytest.fail(f"run_sweep failed unexpectedly: {e}")
             
@@ -310,3 +314,90 @@ class TestRunSweepWithExpressions:
 
         # Freq 2 (2 GHz): R = 50 * (2e9/1e9) = 100 ohm. Y = 1/100 = 0.01 S
         assert np.isclose(y_matrices[1, 0, 0], 1/100.0)
+
+
+# --- Mock Faulty Component for Contract Test ---
+@register_component("FaultyResistorBadAdmittance") # Register with a unique name for the test
+class FaultyResistorBadAdmittance(ComponentBase):
+    component_type_str: str = "FaultyResistorBadAdmittance"
+
+    @classmethod
+    def declare_parameters(cls) -> dict:
+        return {"resistance": "ohm"}
+
+    @classmethod
+    def declare_ports(cls) -> list:
+        return [0, 1]
+
+    def get_mna_stamps(self, freq_hz: np.ndarray, resolved_params: dict) -> list:
+        # This component incorrectly returns stamps with 'ohm' dimension instead of 'siemens'
+        r_qty = resolved_params['resistance']
+        r_val = r_qty.magnitude[0] # scalar R
+        
+        # Create a 2x2 matrix of values that would be conductances if R was used for Y
+        # But wrap it in 'ohm' units intentionally
+        y_val_if_conductance = 1.0 / r_val if r_val != 0 else 1e12 # Simplified
+        
+        stamp_mag_ohms = np.array([
+            [y_val_if_conductance, -y_val_if_conductance],
+            [-y_val_if_conductance, y_val_if_conductance]
+        ], dtype=np.complex128)
+
+        # If freq_hz has multiple points, stamps should be (num_freqs, N, N)
+        # For this test, MnaAssembler calls with freq_hz of shape (1,)
+        stamp_mag_ohms_freq_vector = stamp_mag_ohms.reshape(1, 2, 2)
+
+        # CRITICAL ERROR: Returning with 'ohm' dimension
+        admittance_matrix_wrong_dim_qty = Quantity(stamp_mag_ohms_freq_vector, ureg.ohm)
+        return [(admittance_matrix_wrong_dim_qty, [0, 1])] # Port IDs match declare_ports
+
+    # Dummy implementations for other abstract methods
+    def get_dc_behavior(self, resolved_params: dict) -> tuple[DCBehaviorType, Quantity | None]:
+        return (DCBehaviorType.ADMITTANCE, Quantity(0, "siemens")) # Dummy
+
+    def is_structurally_open(self, resolved_constant_params: dict) -> bool:
+        return False # Dummy
+    
+class TestMnaComponentContractEnforcement:
+
+    def test_assemble_component_returns_wrong_dimension_stamps(self, circuit_builder_instance):
+        """
+        Tests that MnaAssembler raises ComponentError (wrapping pint.DimensionalityError)
+        if a component's get_mna_stamps returns a Quantity with dimensions
+        other than [admittance].
+        """
+        # Ensure the faulty component is registered before creating the circuit
+        # (The class decorator should handle this, but good to be aware)
+        assert "FaultyResistorBadAdmittance" in COMPONENT_REGISTRY
+
+        parsed_circuit = create_parsed_circuit_for_mna_tests(
+            name="FaultyComponentCircuit",
+            raw_global_params={},
+            components_data=[
+                {
+                    "id": "FR1", "type": "FaultyResistorBadAdmittance", # Use the faulty component
+                    "parameters": {"resistance": "50 ohm"},
+                    "ports": {0: "N_in", 1: "gnd"}
+                }
+            ],
+            external_ports_data=[{"id": "N_in", "reference_impedance": "50 ohm"}]
+        )
+        
+        # CircuitBuilder should successfully build this as it doesn't check stamp dimensions
+        sim_circuit = circuit_builder_instance.build_circuit(parsed_circuit)
+        
+        assembler = MnaAssembler(sim_circuit)
+        freq_hz = 1e9
+
+        with pytest.raises(ComponentError) as excinfo:
+            assembler.assemble(freq_hz)
+        
+        # Check that the raised ComponentError was caused by a pint.DimensionalityError
+        assert isinstance(excinfo.value.__cause__, pint.DimensionalityError), \
+            f"Expected cause to be pint.DimensionalityError, got {type(excinfo.value.__cause__)}"
+        
+        # Check the error message content (optional, but good for specificity)
+        # The DimensionalityError message from Pint is quite specific
+        dim_error_msg = str(excinfo.value.__cause__)
+        assert "Cannot convert from 'ohm' (ohm) to 'siemens'" in dim_error_msg or \
+               "are not dimensionally compatible with admittance/conductance" in str(excinfo.value)

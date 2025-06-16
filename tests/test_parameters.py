@@ -9,8 +9,9 @@ from typing import List, Dict, Any
 import re
 
 # Imports from the source code
-from rfsim_core.units import ureg, Quantity
-from rfsim_core.parameters import (
+from src.rfsim_core import (SemanticValidationError, MnaInputError)
+from src.rfsim_core.units import ureg, Quantity
+from src.rfsim_core.parameters import (
     ParameterManager,
     ParameterDefinition,
     ParameterError,
@@ -19,6 +20,10 @@ from rfsim_core.parameters import (
     ParameterScopeError,
     CircularParameterDependencyError,
 )
+from src.rfsim_core.simulation.mna import MnaAssembler # For integration test
+from src.rfsim_core.circuit_builder import CircuitBuilder
+from tests.conftest import create_and_build_circuit
+
 # Mock Component Registry for testing instance param dimension lookup context
 # In a real setup, this might be handled differently, but sufficient for unit testing PM
 MOCK_COMPONENT_REGISTRY = {
@@ -138,26 +143,26 @@ class TestParameterManagerBuildSuccess:
         assert pm._dependency_graph.number_of_edges() == 0
 
         # Check context map
-        assert 'global.R0' in pm._parameter_context_map
-        assert pm._parameter_context_map['global.R0']['declared_dimension'] == 'ohm'
-        assert pm._parameter_context_map['global.R0']['dependencies'] == set()
-        assert pm._parameter_context_map['global.R0']['sympy_expr'] is None
+        assert '_rfsim_global_.R0' in pm._parameter_context_map
+        assert pm._parameter_context_map['_rfsim_global_.R0']['declared_dimension'] == 'ohm'
+        assert pm._parameter_context_map['_rfsim_global_.R0']['dependencies'] == set()
+        assert pm._parameter_context_map['_rfsim_global_.R0']['sympy_expr'] is None
 
-        assert 'global.L_val' in pm._parameter_context_map
-        assert pm._parameter_context_map['global.L_val']['declared_dimension'] == 'henry' # Dimensionality of henry
+        assert '_rfsim_global_.L_val' in pm._parameter_context_map
+        assert pm._parameter_context_map['_rfsim_global_.L_val']['declared_dimension'] == 'henry' # Dimensionality of henry
         assert 'R1.resistance' in pm._parameter_context_map
 
         # Check constant values
-        assert pm.get_constant_value('global.R0') == Quantity(50.0, 'ohm')
-        assert pm.get_constant_value('global.L_val') == Quantity(10.0, 'nH')
+        assert pm.get_constant_value('_rfsim_global_.R0') == Quantity(50.0, 'ohm')
+        assert pm.get_constant_value('_rfsim_global_.L_val') == Quantity(10.0, 'nH')
         assert pm.get_constant_value('R1.resistance') == Quantity(1.0, 'kohm')
 
         # Check dependencies via accessor
-        assert pm.get_dependencies('global.R0') == set()
+        assert pm.get_dependencies('_rfsim_global_.R0') == set()
         assert pm.get_dependencies('R1.resistance') == set()
 
         # Check graph directly (optional)
-        assert set(pm._dependency_graph.nodes) == {'global.R0', 'global.L_val', 'R1.resistance'}
+        assert set(pm._dependency_graph.nodes) == {'_rfsim_global_.R0', '_rfsim_global_.L_val', 'R1.resistance'}
         assert list(pm._dependency_graph.edges) == []
 
     def test_build_simple_expression_global_dep(self, empty_pm):
@@ -178,32 +183,32 @@ class TestParameterManagerBuildSuccess:
         # NEW assertion (Task 5.2 integration expectation)
         assert len(pm._compiled_functions) == 2 # Check that cap_val and res_val were compiled
         # Optional: Add more specific checks
-        assert 'global.cap_val' in pm._compiled_functions
-        assert 'global.res_val' in pm._compiled_functions
-        assert callable(pm._compiled_functions['global.cap_val'])
-        assert callable(pm._compiled_functions['global.res_val'])
+        assert '_rfsim_global_.cap_val' in pm._compiled_functions
+        assert '_rfsim_global_.res_val' in pm._compiled_functions
+        assert callable(pm._compiled_functions['_rfsim_global_.cap_val'])
+        assert callable(pm._compiled_functions['_rfsim_global_.res_val'])
 
-        assert 'global.cap_val' in pm._parameter_context_map
-        assert pm._parameter_context_map['global.cap_val']['dependencies'] == {'freq'} # Only depends on reserved 'freq'
-        assert isinstance(pm._parameter_context_map['global.cap_val']['sympy_expr'], sympy.Expr)
+        assert '_rfsim_global_.cap_val' in pm._parameter_context_map
+        assert pm._parameter_context_map['_rfsim_global_.cap_val']['dependencies'] == {'freq'} # Only depends on reserved 'freq'
+        assert isinstance(pm._parameter_context_map['_rfsim_global_.cap_val']['sympy_expr'], sympy.Expr)
 
-        assert 'global.res_val' in pm._parameter_context_map
-        assert pm._parameter_context_map['global.res_val']['dependencies'] == {'global.R0'} # Resolved correctly
-        assert isinstance(pm._parameter_context_map['global.res_val']['sympy_expr'], sympy.Expr)
+        assert '_rfsim_global_.res_val' in pm._parameter_context_map
+        assert pm._parameter_context_map['_rfsim_global_.res_val']['dependencies'] == {'_rfsim_global_.R0'} # Resolved correctly
+        assert isinstance(pm._parameter_context_map['_rfsim_global_.res_val']['sympy_expr'], sympy.Expr)
 
-        assert pm.get_dependencies('global.freq_ghz') == set()
-        assert pm.get_dependencies('global.R0') == set()
-        assert pm.get_dependencies('global.cap_val') == {'freq'}
-        assert pm.get_dependencies('global.res_val') == {'global.R0'}
+        assert pm.get_dependencies('_rfsim_global_.freq_ghz') == set()
+        assert pm.get_dependencies('_rfsim_global_.R0') == set()
+        assert pm.get_dependencies('_rfsim_global_.cap_val') == {'freq'}
+        assert pm.get_dependencies('_rfsim_global_.res_val') == {'_rfsim_global_.R0'}
 
         # Check graph
         assert pm._dependency_graph.has_node('freq')
-        assert pm._dependency_graph.has_edge('global.cap_val', 'freq')
-        assert pm._dependency_graph.has_edge('global.res_val', 'global.R0')
+        assert pm._dependency_graph.has_edge('_rfsim_global_.cap_val', 'freq')
+        assert pm._dependency_graph.has_edge('_rfsim_global_.res_val', '_rfsim_global_.R0')
         assert pm._dependency_graph.number_of_edges() == 2
 
     def test_build_expression_instance_and_global_dep(self, empty_pm):
-        """Test expression in instance param depending on another instance param and a global."""
+        """Test expression in instance param depending on another instance param and a _rfsim_global_."""
         pm = empty_pm
         defs = create_defs([
             {'name': 'global_gain', 'scope': 'global', 'constant': '10', 'dimension': 'dimensionless'}, # Fix 3
@@ -220,14 +225,14 @@ class TestParameterManagerBuildSuccess:
         assert len(pm._parameter_context_map) == 5
 
         # Check dependencies for R1.scaled_res
-        assert pm.get_dependencies('R1.scaled_res') == {'R1.base_res', 'global.global_gain'}
+        assert pm.get_dependencies('R1.scaled_res') == {'R1.base_res', '_rfsim_global_.global_gain'}
 
         # Check dependencies for R2.dep_res (now handles explicit R1.scaled_res)
         assert pm.get_dependencies('R2.dep_res') == {'R1.scaled_res'}
 
         # Check graph
         assert pm._dependency_graph.has_edge('R1.scaled_res', 'R1.base_res')
-        assert pm._dependency_graph.has_edge('R1.scaled_res', 'global.global_gain')
+        assert pm._dependency_graph.has_edge('R1.scaled_res', '_rfsim_global_.global_gain')
         assert pm._dependency_graph.has_edge('R2.dep_res', 'R1.scaled_res')
         assert not pm._dependency_graph.has_edge('R2.dep_res', 'R2.other_res') # No longer depends on this
         assert pm._dependency_graph.number_of_edges() == 3
@@ -253,7 +258,7 @@ class TestParameterManagerBuildSuccess:
         pm.add_definitions(defs)
         pm.build()
         # Check that the parsed sympy expression still contains the symbol 'r_one'
-        sympy_expr = pm._parameter_context_map['global.test']['sympy_expr']
+        sympy_expr = pm._parameter_context_map['_rfsim_global_.test']['sympy_expr']
         assert isinstance(sympy_expr, sympy.Expr)
         assert sympy.Symbol('r_one') in sympy_expr.free_symbols
 
@@ -265,18 +270,18 @@ class TestParameterManagerBuildSuccess:
             {'name': 'X', 'scope': 'global', 'constant': '10 V', 'dimension': 'volt'},
             {'name': 'X', 'scope': 'instance', 'owner_id': 'Comp1', 'constant': '5 V', 'dimension': 'volt'},
             {'name': 'Y', 'scope': 'instance', 'owner_id': 'Comp1', 'expression': 'X * 2', 'dimension': 'volt'}, # Should use Comp1.X
-            {'name': 'Z', 'scope': 'global', 'expression': 'X * 3', 'dimension': 'volt'}, # Should use global.X
+            {'name': 'Z', 'scope': 'global', 'expression': 'X * 3', 'dimension': 'volt'}, # Should use _rfsim_global_.X
         ])
         pm.add_definitions(defs)
         pm.build()
 
         assert pm.get_dependencies('Comp1.Y') == {'Comp1.X'}
-        assert pm.get_dependencies('global.Z') == {'global.X'}
+        assert pm.get_dependencies('_rfsim_global_.Z') == {'_rfsim_global_.X'}
 
         assert pm._dependency_graph.has_edge('Comp1.Y', 'Comp1.X')
-        assert pm._dependency_graph.has_edge('global.Z', 'global.X')
-        assert not pm._dependency_graph.has_edge('Comp1.Y', 'global.X')
-        assert not pm._dependency_graph.has_edge('global.Z', 'Comp1.X')
+        assert pm._dependency_graph.has_edge('_rfsim_global_.Z', '_rfsim_global_.X')
+        assert not pm._dependency_graph.has_edge('Comp1.Y', '_rfsim_global_.X')
+        assert not pm._dependency_graph.has_edge('_rfsim_global_.Z', 'Comp1.X')
 
 # --- Test ParameterManager Error Handling During Build ---
 
@@ -289,7 +294,7 @@ class TestParameterManagerBuildErrors:
             {'name': 'R0', 'scope': 'global', 'constant': '100 ohm', 'dimension': 'ohm'},
         ])
         pm.add_definitions(defs)
-        with pytest.raises(ParameterDefinitionError, match="Duplicate internal name 'global.R0'"):
+        with pytest.raises(ParameterDefinitionError, match="Duplicate internal name '_rfsim_global_.R0'"):
             pm.build()
 
     def test_error_duplicate_internal_name_instance(self, empty_pm):
@@ -311,7 +316,7 @@ class TestParameterManagerBuildErrors:
         pm.add_definitions(defs)
         # --- MODIFICATION ---
         # Update the regex to match the actual error message format
-        expected_error_msg_regex = r"Invalid declared_dimension_str 'not_a_dimension' for parameter 'global.R0':"
+        expected_error_msg_regex = r"Invalid declared_dimension_str 'not_a_dimension' for parameter '_rfsim_global_.R0':"
         with pytest.raises(ParameterDefinitionError, match=expected_error_msg_regex):
             pm.build()
 
@@ -323,7 +328,7 @@ class TestParameterManagerBuildErrors:
         ])
         pm.add_definitions(defs)
         # This error now happens during _parse_and_cache_constants
-        with pytest.raises(ParameterDefinitionError, match="Constant value string '50 qqq' for parameter 'global.R0'"):
+        with pytest.raises(ParameterDefinitionError, match="Constant value string '50 qqq' for parameter '_rfsim_global_.R0'"):
             pm.build()
 
     def test_error_expression_syntax_error(self, empty_pm):
@@ -333,7 +338,7 @@ class TestParameterManagerBuildErrors:
             {'name': 'X', 'scope': 'global', 'expression': 'R0 * (2 + )', 'dimension': 'ohm'}, # Syntax error
         ])
         pm.add_definitions(defs)
-        with pytest.raises(ParameterSyntaxError, match="Syntax error parsing expression for 'global.X'.*'R0 \* \(2 \+ \)'"):
+        with pytest.raises(ParameterSyntaxError, match="Syntax error parsing expression for '_rfsim_global_.X'.*'R0 \* \(2 \+ \)'"):
             pm.build()
 
     def test_error_expression_dependency_not_found(self, empty_pm):
@@ -343,7 +348,7 @@ class TestParameterManagerBuildErrors:
             {'name': 'X', 'scope': 'global', 'expression': 'R0 * R1', 'dimension': 'ohm'}, # R1 not defined
         ])
         pm.add_definitions(defs)
-        with pytest.raises(ParameterScopeError, match=re.escape("Dependency resolution failed for expression parameter 'global.X' ('R0 * R1'): Parameter symbol 'R1' referenced in an expression could not be resolved. Context: scope='global'. Searched for <N/A for instance> and 'global.R1'.")):
+        with pytest.raises(ParameterScopeError, match=re.escape("Dependency resolution failed for expression parameter '_rfsim_global_.X' ('R0 * R1'): Parameter symbol 'R1' referenced in an expression could not be resolved. Context: scope='global'. Searched for <N/A for instance> and '_rfsim_global_.R1'.")):
             pm.build()
 
     def test_error_instance_dependency_not_found(self, empty_pm):
@@ -353,7 +358,7 @@ class TestParameterManagerBuildErrors:
             {'name': 'scaled', 'scope': 'instance', 'owner_id':'R1', 'expression': 'resistance * gain', 'dimension': 'ohm'}, # gain not defined
         ])
         pm.add_definitions(defs)
-        with pytest.raises(ParameterScopeError, match=re.escape("Dependency resolution failed for expression parameter 'R1.scaled' ('resistance * gain'): Parameter symbol 'gain' referenced in an expression could not be resolved. Context: scope='instance', owner='R1'. Searched for 'R1.gain' and 'global.gain'.")):
+        with pytest.raises(ParameterScopeError, match=re.escape("Dependency resolution failed for expression parameter 'R1.scaled' ('resistance * gain'): Parameter symbol 'gain' referenced in an expression could not be resolved. Context: scope='instance', owner='R1'. Searched for 'R1.gain' and '_rfsim_global_.gain'.")):
             pm.build()
 
     def test_error_explicit_instance_dependency_not_found(self, empty_pm):
@@ -387,7 +392,7 @@ class TestParameterManagerBuildErrors:
         ])
         pm.add_definitions(defs)
         # The exact cycle order reported by networkx might vary
-        with pytest.raises(CircularParameterDependencyError, match="Circular dependency detected: global.[ABC] -> global.[ABC] -> global.[ABC] -> global.[ABC]"):
+        with pytest.raises(CircularParameterDependencyError, match="Circular dependency detected: _rfsim_global_.[ABC] -> _rfsim_global_.[ABC] -> _rfsim_global_.[ABC] -> _rfsim_global_.[ABC]"):
              pm.build()
 
     def test_error_circular_dependency_instance_global(self, empty_pm):
@@ -427,18 +432,18 @@ class TestParameterManagerBuildErrors:
         with pytest.raises(ParameterError, match="ParameterManager has not been built."):
             pm.get_all_internal_names()
         with pytest.raises(ParameterError, match="ParameterManager has not been built."):
-            pm.get_parameter_definition("global.R0")
+            pm.get_parameter_definition("_rfsim_global_.R0")
         with pytest.raises(ParameterError, match="ParameterManager has not been built."):
-            pm.get_dependencies("global.R0")
+            pm.get_dependencies("_rfsim_global_.R0")
         with pytest.raises(ParameterError, match="ParameterManager has not been built."):
-            pm.is_constant("global.R0")
+            pm.is_constant("_rfsim_global_.R0")
         with pytest.raises(ParameterError, match="ParameterManager has not been built."):
-            pm.get_constant_value("global.R0")
+            pm.get_constant_value("_rfsim_global_.R0")
         with pytest.raises(ParameterError, match="ParameterManager has not been built."):
             # Placeholder methods also need the check
-            pm.get_compiled_function("global.R0")
+            pm.get_compiled_function("_rfsim_global_.R0")
         with pytest.raises(ParameterError, match="ParameterManager has not been built."):
-           pm.resolve_parameter("global.R0", np.array([1e9]), "ohm", {})
+           pm.resolve_parameter("_rfsim_global_.R0", np.array([1e9]), "ohm", {})
 
 
 # --- Test Accessors after successful build ---
@@ -463,10 +468,10 @@ class TestParameterManagerAccessors:
     def test_get_all_internal_names(self, built_pm):
         names = built_pm.get_all_internal_names()
         assert isinstance(names, list)
-        assert set(names) == {'global.R0', 'global.L_val', 'global.Scale', 'R1.resistance', 'R1.current'}
+        assert set(names) == {'_rfsim_global_.R0', '_rfsim_global_.L_val', '_rfsim_global_.Scale', 'R1.resistance', 'R1.current'}
 
     def test_get_parameter_definition(self, built_pm):
-        defn = built_pm.get_parameter_definition('global.R0')
+        defn = built_pm.get_parameter_definition('_rfsim_global_.R0')
         assert isinstance(defn, ParameterDefinition)
         assert defn.name == 'R0'
         assert defn.scope == 'global'
@@ -483,9 +488,9 @@ class TestParameterManagerAccessors:
             built_pm.get_parameter_definition('nonexistent.param')
 
     def test_get_declared_dimension(self, built_pm):
-        assert built_pm.get_declared_dimension('global.R0') == 'ohm' # ohm
-        assert built_pm.get_declared_dimension('global.L_val') == 'henry' # henry
-        assert built_pm.get_declared_dimension('global.Scale') == 'dimensionless' # Dimensionless
+        assert built_pm.get_declared_dimension('_rfsim_global_.R0') == 'ohm' # ohm
+        assert built_pm.get_declared_dimension('_rfsim_global_.L_val') == 'henry' # henry
+        assert built_pm.get_declared_dimension('_rfsim_global_.Scale') == 'dimensionless' # Dimensionless
         assert built_pm.get_declared_dimension('R1.resistance') == 'ohm' # ohm
         # Check admittance dimension string formatting by Pint
 
@@ -495,9 +500,9 @@ class TestParameterManagerAccessors:
             built_pm.get_declared_dimension('nonexistent.param')
 
     def test_get_dependencies(self, built_pm):
-        assert built_pm.get_dependencies('global.R0') == set()
-        assert built_pm.get_dependencies('global.L_val') == set()
-        assert built_pm.get_dependencies('global.Scale') == {'global.L_val'}
+        assert built_pm.get_dependencies('_rfsim_global_.R0') == set()
+        assert built_pm.get_dependencies('_rfsim_global_.L_val') == set()
+        assert built_pm.get_dependencies('_rfsim_global_.Scale') == {'_rfsim_global_.L_val'}
         assert built_pm.get_dependencies('R1.resistance') == set()
         assert built_pm.get_dependencies('R1.current') == {'R1.resistance'}
 
@@ -505,9 +510,9 @@ class TestParameterManagerAccessors:
             built_pm.get_dependencies('nonexistent.param')
 
     def test_is_constant(self, built_pm):
-        assert built_pm.is_constant('global.R0') is True
-        assert built_pm.is_constant('global.L_val') is True
-        assert built_pm.is_constant('global.Scale') is False # Expression
+        assert built_pm.is_constant('_rfsim_global_.R0') is True
+        assert built_pm.is_constant('_rfsim_global_.L_val') is True
+        assert built_pm.is_constant('_rfsim_global_.Scale') is False # Expression
         assert built_pm.is_constant('R1.resistance') is True
         assert built_pm.is_constant('R1.current') is False # Expression
 
@@ -515,13 +520,13 @@ class TestParameterManagerAccessors:
              built_pm.is_constant('nonexistent.param')
 
     def test_get_constant_value(self, built_pm):
-        assert built_pm.get_constant_value('global.R0') == Quantity(50, 'ohm')
-        assert built_pm.get_constant_value('global.L_val') == Quantity(10, 'nH')
+        assert built_pm.get_constant_value('_rfsim_global_.R0') == Quantity(50, 'ohm')
+        assert built_pm.get_constant_value('_rfsim_global_.L_val') == Quantity(10, 'nH')
         assert built_pm.get_constant_value('R1.resistance') == Quantity(1, 'kohm')
 
         # Test error for expression param
-        with pytest.raises(ParameterError, match=re.escape("Parameter 'global.Scale' is an expression ('L_val * 1e9') and cannot be retrieved as a simple constant value. Use resolve_parameter().")): # More specific match
-            built_pm.get_constant_value('global.Scale')
+        with pytest.raises(ParameterError, match=re.escape("Parameter '_rfsim_global_.Scale' is an expression ('L_val * 1e9') and cannot be retrieved as a simple constant value. Use resolve_parameter().")): # More specific match
+            built_pm.get_constant_value('_rfsim_global_.Scale')
         with pytest.raises(ParameterError, match=re.escape("R1.current' is an expression ('1 / resistance') and cannot be retrieved as a simple constant value. Use resolve_parameter().")): # More specific match
             built_pm.get_constant_value('R1.current')
 
@@ -572,12 +577,12 @@ class TestParameterManagerResolveParameter:
         pm = comprehensive_built_pm
         freq = np.array([1e9])
         context = {}
-        q = pm.resolve_parameter("global.R_const", freq, "ohm", context)
+        q = pm.resolve_parameter("_rfsim_global_.R_const", freq, "ohm", context)
         assert isinstance(q, Quantity)
         assert q.magnitude == pytest.approx(np.array([50.0]))
         assert q.check("[resistance]") # Check base dimension
 
-        q_kohm = pm.resolve_parameter("global.R_const", freq, "kiloohm", context)
+        q_kohm = pm.resolve_parameter("_rfsim_global_.R_const", freq, "kiloohm", context)
         assert q_kohm.magnitude == pytest.approx(np.array([0.05]))
         assert q_kohm.check("[resistance]")
 
@@ -585,7 +590,7 @@ class TestParameterManagerResolveParameter:
         pm = comprehensive_built_pm
         freq = np.array([1e9, 2e9, 3e9])
         context = {}
-        q = pm.resolve_parameter("global.Val_dimless", freq, "dimensionless", context)
+        q = pm.resolve_parameter("_rfsim_global_.Val_dimless", freq, "dimensionless", context)
         assert q.magnitude.shape == freq.shape
         assert np.all(q.magnitude == pytest.approx(2.5))
 
@@ -593,7 +598,7 @@ class TestParameterManagerResolveParameter:
         pm = comprehensive_built_pm
         freq = np.array([1e9])
         context = {}
-        q = pm.resolve_parameter("global.C_ref_R", freq, "ohm", context)
+        q = pm.resolve_parameter("_rfsim_global_.C_ref_R", freq, "ohm", context)
         assert q.magnitude == pytest.approx(np.array([50.0]))
 
     def test_resolve_constant_incompatible_target_dim(self, comprehensive_built_pm):
@@ -602,13 +607,13 @@ class TestParameterManagerResolveParameter:
         context = {}
         # Adjusted regex to be more robust to pint's error message formatting
         with pytest.raises(pint.DimensionalityError, match=r"Cannot convert from 'ohm' .* to 'farad'"):
-            pm.resolve_parameter("global.R_const", freq, "farad", context)
+            pm.resolve_parameter("_rfsim_global_.R_const", freq, "farad", context)
 
     def test_resolve_constant_empty_freq(self, comprehensive_built_pm):
         pm = comprehensive_built_pm
         freq = np.array([], dtype=float)
         context = {}
-        q = pm.resolve_parameter("global.R_const", freq, "ohm", context)
+        q = pm.resolve_parameter("_rfsim_global_.R_const", freq, "ohm", context)
         assert isinstance(q, Quantity)
         assert q.magnitude.shape == (0,)
         assert q.check("[resistance]")
@@ -617,53 +622,53 @@ class TestParameterManagerResolveParameter:
     def test_resolve_simple_expression(self, comprehensive_built_pm):
         pm = comprehensive_built_pm
         # Example: 'Val_dimless * 2' - needs new param
-        # For now, let's use an existing expression: global.L_scaled = L_const_nH * Val_dimless
+        # For now, let's use an existing expression: _rfsim_global_.L_scaled = L_const_nH * Val_dimless
         freq = np.array([1e9])
         context = {}
         # L_const_nH = 10 nH, Val_dimless = 2.5
         # L_scaled = 10 nH * 2.5 = 25 nH
-        q = pm.resolve_parameter("global.L_scaled", freq, "nanohenry", context)
+        q = pm.resolve_parameter("_rfsim_global_.L_scaled", freq, "nanohenry", context)
         assert q.magnitude == pytest.approx(np.array([25.0]))
         assert q.check("[inductance]")
 
-        q_H = pm.resolve_parameter("global.L_scaled", freq, "henry", context)
+        q_H = pm.resolve_parameter("_rfsim_global_.L_scaled", freq, "henry", context)
         assert q_H.magnitude == pytest.approx(np.array([25e-9]))
 
     def test_resolve_freq_dependent_expression(self, comprehensive_built_pm):
         pm = comprehensive_built_pm
         freq = np.array([1e9]) # 1 GHz
         context = {}
-        # global.Freq_dep_X = freq * 1e-12
-        q = pm.resolve_parameter("global.Freq_dep_X", freq, "dimensionless", context)
+        # _rfsim_global_.Freq_dep_X = freq * 1e-12
+        q = pm.resolve_parameter("_rfsim_global_.Freq_dep_X", freq, "dimensionless", context)
         assert q.magnitude == pytest.approx(np.array([1e9 * 1e-12])) # 1e-3
 
         freq_multi = np.array([1e9, 2e9])
         context = {}
-        q_multi = pm.resolve_parameter("global.Freq_dep_X", freq_multi, "dimensionless", context)
+        q_multi = pm.resolve_parameter("_rfsim_global_.Freq_dep_X", freq_multi, "dimensionless", context)
         assert q_multi.magnitude == pytest.approx(np.array([1e-3, 2e-3]))
 
     def test_resolve_expression_with_deps(self, comprehensive_built_pm):
         pm = comprehensive_built_pm
         freq = np.array([1e9])
         context = {}
-        # global.Calc_C = 1 / (2 * pi * freq * R_const)
+        # _rfsim_global_.Calc_C = 1 / (2 * pi * freq * R_const)
         # R_const = 50 ohm
         expected_c = 1 / (2 * np.pi * 1e9 * 50)
-        q = pm.resolve_parameter("global.Calc_C", freq, "farad", context)
+        q = pm.resolve_parameter("_rfsim_global_.Calc_C", freq, "farad", context)
         assert q.magnitude == pytest.approx(np.array([expected_c]))
 
     def test_resolve_expression_numpy_funcs(self, comprehensive_built_pm):
         pm = comprehensive_built_pm
         freq = np.array([1e8]) # 100 MHz for log10 to be 8
         context = {}
-        q = pm.resolve_parameter("global.Log_val", freq, "dimensionless", context)
+        q = pm.resolve_parameter("_rfsim_global_.Log_val", freq, "dimensionless", context)
         assert q.magnitude == pytest.approx(np.array([8.0]))
 
     def test_resolve_expression_empty_freq(self, comprehensive_built_pm):
         pm = comprehensive_built_pm
         freq = np.array([], dtype=float)
         context = {}
-        q = pm.resolve_parameter("global.Freq_dep_X", freq, "dimensionless", context)
+        q = pm.resolve_parameter("_rfsim_global_.Freq_dep_X", freq, "dimensionless", context)
         assert isinstance(q, Quantity)
         assert q.magnitude.shape == (0,)
 
@@ -679,8 +684,8 @@ class TestParameterManagerResolveParameter:
         pm = comprehensive_built_pm
         freq = np.array([1e9])
         context = {}
-        # C1.c_inst_expr = global.Calc_C / 2
-        # global.Calc_C = 1 / (2 * pi * freq * R_const)
+        # C1.c_inst_expr = _rfsim_global_.Calc_C / 2
+        # _rfsim_global_.Calc_C = 1 / (2 * pi * freq * R_const)
         # R_const = 50 ohm
         calc_c_val = 1 / (2 * np.pi * 1e9 * 50)
         expected_c_inst = calc_c_val / 2
@@ -691,9 +696,9 @@ class TestParameterManagerResolveParameter:
         pm = comprehensive_built_pm
         freq = np.array([1e9]) # freq doesn't matter for this expression
         context = {}
-        # AMP1.gain = sqrt(R1.r_inst_val / global.R_const)
+        # AMP1.gain = sqrt(R1.r_inst_val / _rfsim_global_.R_const)
         # R1.r_inst_val = 1 kohm = 1000 ohm
-        # global.R_const = 50 ohm
+        # _rfsim_global_.R_const = 50 ohm
         expected_gain = np.sqrt(1000 / 50)
         q = pm.resolve_parameter("AMP1.gain", freq, "dimensionless", context)
         assert q.magnitude == pytest.approx(np.array([expected_gain]))
@@ -724,16 +729,16 @@ class TestParameterManagerResolveParameter:
         try:
             # D3_expr = D2_expr * 3; D2_expr = D1 * 2; D1 = 10 pF
             # Resolve D3_expr, target_dimension_str 'farad'
-            _ = pm.resolve_parameter("global.D3_expr", freq, "farad", context)
+            _ = pm.resolve_parameter("_rfsim_global_.D3_expr", freq, "farad", context)
 
             # Check target dimensions used for dependencies:
             # When resolving D3_expr, it needs D2_expr. D2_expr's declared_dimension is 'farad'.
-            assert resolved_interమediates.get("global.D2_expr") == "farad"
+            assert resolved_interమediates.get("_rfsim_global_.D2_expr") == "farad"
             # When D2_expr was resolved (possibly initiated by D3_expr's call), it needed D1.
             # D1's declared_dimension is 'farad'.
             # This might be called multiple times if context is not passed correctly or mock is simple.
             # The key is that *a* call to resolve D1 eventually happened with 'farad'.
-            assert resolved_interమediates.get("global.D1") == "farad"
+            assert resolved_interమediates.get("_rfsim_global_.D1") == "farad"
 
         finally:
             pm.resolve_parameter = original_resolve # Restore
@@ -747,7 +752,7 @@ class TestParameterManagerResolveParameter:
         # To check memoization, we can see if a computationally intensive part (like compiled_func)
         # is called multiple times.
         # Let's spy on a compiled function.
-        original_compiled_func = pm._compiled_functions.get("global.Calc_C")
+        original_compiled_func = pm._compiled_functions.get("_rfsim_global_.Calc_C")
         assert original_compiled_func is not None
         call_count = 0
 
@@ -756,21 +761,21 @@ class TestParameterManagerResolveParameter:
             call_count += 1
             return original_compiled_func(*args, **kwargs)
 
-        pm._compiled_functions["global.Calc_C"] = spy_compiled_func
+        pm._compiled_functions["_rfsim_global_.Calc_C"] = spy_compiled_func
 
         try:
-            _ = pm.resolve_parameter("global.Calc_C", freq, "farad", context)
+            _ = pm.resolve_parameter("_rfsim_global_.Calc_C", freq, "farad", context)
             assert call_count == 1 # Called once
 
-            _ = pm.resolve_parameter("global.Calc_C", freq, "farad", context) # Same context
+            _ = pm.resolve_parameter("_rfsim_global_.Calc_C", freq, "farad", context) # Same context
             assert call_count == 1 # Should be memoized, not called again
 
             context2 = {} # Different context
-            _ = pm.resolve_parameter("global.Calc_C", freq, "farad", context2)
+            _ = pm.resolve_parameter("_rfsim_global_.Calc_C", freq, "farad", context2)
             assert call_count == 2 # Called again with new context
 
         finally:
-            pm._compiled_functions["global.Calc_C"] = original_compiled_func # Restore
+            pm._compiled_functions["_rfsim_global_.Calc_C"] = original_compiled_func # Restore
 
 
     # --- Tests for Error Handling in resolve_parameter ---
@@ -778,15 +783,15 @@ class TestParameterManagerResolveParameter:
         pm = comprehensive_built_pm
         freq = np.array([1e9])
         context = {}
-        with pytest.raises(ParameterScopeError, match="Parameter 'global.NonExistent' not found in context map"):
-            pm.resolve_parameter("global.NonExistent", freq, "dimensionless", context)
+        with pytest.raises(ParameterScopeError, match="Parameter '_rfsim_global_.NonExistent' not found in context map"):
+            pm.resolve_parameter("_rfsim_global_.NonExistent", freq, "dimensionless", context)
 
     def test_resolve_error_numerical_in_expression(self, comprehensive_built_pm):
         pm = comprehensive_built_pm
         freq = np.array([1e9]) 
         context = {}
         
-        # Test for 'global.Div_by_zero_expr' which should fail during ParameterManager.build()
+        # Test for '_rfsim_global_.Div_by_zero_expr' which should fail during ParameterManager.build()
         # So, we can't resolve it here. This part of the test needs to reflect that.
         # This part of the original test is now invalid because '1/0' should be caught at build time.
         # We'll test it by trying to build a PM with it separately.
@@ -799,22 +804,22 @@ class TestParameterManagerResolveParameter:
             temp_pm_div_zero.build()
 
 
-        # Test for 'global.Div_by_freq_expr' = '1/freq'
+        # Test for '_rfsim_global_.Div_by_freq_expr' = '1/freq'
         freq_zero = np.array([0.0])
         context_f0 = {}
         with pytest.raises(ParameterError) as excinfo:
-            pm.resolve_parameter("global.Div_by_freq_expr", freq_zero, "siemens", context_f0)
+            pm.resolve_parameter("_rfsim_global_.Div_by_freq_expr", freq_zero, "siemens", context_f0)
         
         assert "Numerical floating point error during evaluation" in str(excinfo.value) or \
                "division by zero" in str(excinfo.value).lower()
-        assert "global.Div_by_freq_expr" in str(excinfo.value)
+        assert "_rfsim_global_.Div_by_freq_expr" in str(excinfo.value)
         assert "1/freq" in str(excinfo.value) # Check expression is in error
 
         # Test that it works for non-zero frequency
         freq_ok = np.array([1e9])
         context_ok = {}
         try:
-            q_ok = pm.resolve_parameter("global.Div_by_freq_expr", freq_ok, "siemens", context_ok)
+            q_ok = pm.resolve_parameter("_rfsim_global_.Div_by_freq_expr", freq_ok, "siemens", context_ok)
             assert isinstance(q_ok, Quantity)
             assert np.isclose(q_ok.magnitude, 1e-9)
         except ParameterError:
@@ -824,28 +829,28 @@ class TestParameterManagerResolveParameter:
         pm = comprehensive_built_pm
         freq = np.array([1e9])
         context = {}
-        # global.Freq_dep_X will evaluate to a number.
+        # _rfsim_global_.Freq_dep_X will evaluate to a number.
         # Try to create Quantity with an invalid target_dimension_str string
-        with pytest.raises(ParameterError, match=re.escape(r"Error processing evaluated result for 'global.Freq_dep_X'. Numerical result (shape (1,), dtype float64) with its declared dimension 'dimensionless' could not be converted to target dimension 'invalid_unit_str': 'invalid_unit_str' is not defined in the unit registry")):
-            pm.resolve_parameter("global.Freq_dep_X", freq, "invalid_unit_str", context)
+        with pytest.raises(ParameterError, match=re.escape(r"Error processing evaluated result for '_rfsim_global_.Freq_dep_X'. Numerical result (shape (1,), dtype float64) with its declared dimension 'dimensionless' could not be converted to target dimension 'invalid_unit_str': 'invalid_unit_str' is not defined in the unit registry")):
+            pm.resolve_parameter("_rfsim_global_.Freq_dep_X", freq, "invalid_unit_str", context)
 
     def test_resolve_freq_hz_not_numpy_array(self, comprehensive_built_pm):
         pm = comprehensive_built_pm
         context = {}
         # freq_hz as list
-        q_list = pm.resolve_parameter("global.R_const", [1e9, 2e9], "ohm", context)
+        q_list = pm.resolve_parameter("_rfsim_global_.R_const", [1e9, 2e9], "ohm", context)
         assert isinstance(q_list.magnitude, np.ndarray)
         assert q_list.magnitude.shape == (2,)
 
         # freq_hz as float scalar
         context = {} # new context
-        q_float = pm.resolve_parameter("global.R_const", 1e9, "ohm", context)
+        q_float = pm.resolve_parameter("_rfsim_global_.R_const", 1e9, "ohm", context)
         assert isinstance(q_float.magnitude, np.ndarray)
         assert q_float.magnitude.shape == (1,) # Will be converted to [1e9] internally
 
         # freq_hz as 0D numpy array
         context = {}
-        q_0d = pm.resolve_parameter("global.R_const", np.array(1e9), "ohm", context)
+        q_0d = pm.resolve_parameter("_rfsim_global_.R_const", np.array(1e9), "ohm", context)
         assert isinstance(q_0d.magnitude, np.ndarray)
         assert q_0d.magnitude.shape == (1,)
 
@@ -864,5 +869,94 @@ class TestParameterManagerResolveParameter:
         pm.add_definitions(defs)
         pm.build()
 
-        with pytest.raises(ParameterError, match=r"Failed to resolve parameter 'global\.P1' to a constant value: Parameter 'global\.P2' .* is an expression"):
-            pm.resolve_parameter("global.P1", np.array([1e9]), "ohm", {})
+        with pytest.raises(ParameterError, match=r"Failed to resolve parameter '_rfsim_global_\.P1' to a constant value: Parameter '_rfsim_global_\.P2' .* is an expression"):
+            pm.resolve_parameter("_rfsim_global_.P1", np.array([1e9]), "ohm", {})
+
+    def test_resolve_dimensionally_inconsistent_expression(self, circuit_builder_instance):
+        """
+        Tests that an expression which is numerically evaluable but dimensionally
+        inconsistent (e.g., "10 meter + 5") results in a Quantity with the
+        parameter's declared dimension, using the numerical result.
+        This behavior is by design: user is responsible for dimensional correctness
+        within expressions if physical meaning is desired beyond numerical evaluation.
+        """
+        # Define a circuit where R1.resistance (ohms) is set by an expression "length_param + some_number"
+        # length_param is "10 meter", some_number is 5.
+        # Expected numerical evaluation: 10 + 5 = 15.
+        # Expected final Quantity for R1.resistance: Quantity(15, "ohm").
+        components_def = [
+            ("R1", "Resistor", 
+             # MODIFIED: Use the new prefix for global parameter in expression
+             {"resistance": {"expression": "_rfsim_global_.length_param + 5"}}, 
+             {"0": "N1", "1": "gnd"})
+        ]
+        global_params_def = {
+            "length_param": "10 meter" # This will be inferred as 'meter'
+        }
+        
+        # 1. Test ParameterManager resolution directly
+        pm = ParameterManager()
+        # Manually create ParameterDefinitions like CircuitBuilder would
+        # Note: CircuitBuilder infers 'ohm' for R1.resistance from Resistor.declare_parameters()
+        # and 'meter' for _rfsim_global_.length_param from its value.
+        defs = [
+            ParameterDefinition(name="length_param", scope="global", constant_value_str="10 meter", declared_dimension_str="meter"),
+            ParameterDefinition(name="resistance", scope="instance", owner_id="R1", 
+                                # Expression "length_param + 5" refers to an unqualified 'length_param'.
+                                # ParameterManager will try to resolve 'length_param' to 'R1.length_param' (not found),
+                                # then to '_rfsim_global_.length_param' (found).
+                                expression_str="length_param + 5", declared_dimension_str="ohm")
+        ]
+        pm.add_definitions(defs)
+        pm.build()
+
+        freq_array = np.array([1e9])
+        eval_context = {}
+        
+        # ParameterManager should resolve _rfsim_global_.length_param as 10 meter
+        # MODIFIED: Use the new internal name for the global parameter
+        len_q = pm.resolve_parameter("_rfsim_global_.length_param", freq_array, "meter", eval_context)
+        assert len_q.magnitude == pytest.approx(np.array([10.0]))
+        assert len_q.units == ureg.meter
+
+        # R1.resistance resolves:
+        # Expression "length_param + 5" -> SymPy uses magnitudes -> 10 (from _rfsim_global_.length_param) + 5 = 15
+        # Result 15 is then given the declared dimension "ohm" for R1.resistance
+        res_q = pm.resolve_parameter("R1.resistance", freq_array, "ohm", eval_context)
+        
+        assert isinstance(res_q, Quantity)
+        assert res_q.magnitude == pytest.approx(np.array([15.0]))
+        assert res_q.units == ureg.ohm
+        assert res_q.check("[resistance]")
+
+        # 2. Test integration through MNA assembly
+        # Create the circuit using the helper which calls CircuitBuilder
+        sim_circuit_inconsistent_expr = create_and_build_circuit(
+            circuit_builder_instance,
+            components_def, # components_def already updated with _rfsim_global_
+            global_params_def=global_params_def,
+            external_ports_def={"N1": "50 ohm"},
+            circuit_name="TestInconsistentExpr"
+        )
+
+        # Basic check: Ensure circuit built and parameters are resolvable by MNAAssembler
+        # (MNAAssembler will internally call ParameterManager.resolve_parameter)
+        try:
+            assembler = MnaAssembler(sim_circuit_inconsistent_expr)
+            # If assembly of the R1 component doesn't crash on parameter resolution, it's a good sign.
+            # We expect R1's resistance to be resolved to 15 ohm.
+            # We can even check the stamp if we want to be very thorough here,
+            # but for this test, not crashing is the main goal for the integration part.
+            _ = assembler.assemble(freq_hz=1e9) # Try to assemble
+            # Further check: retrieve the actual resolved resistance if possible
+            # (This requires more complex access to internal MNA data or component state,
+            #  which might not be exposed. For now, not crashing is sufficient for this integration test part).
+            r1_sim_comp = sim_circuit_inconsistent_expr.sim_components.get("R1")
+            assert r1_sim_comp is not None
+
+            # Check the actual resolved parameter by the component (if a method exists to do so,
+            # or by checking its stamp value). For now, let's assume if assemble works, it's fine.
+            # This is more of a "does it integrate without syntax error" check.
+
+        except (ParameterError, SemanticValidationError, MnaInputError) as e:
+            pytest.fail(f"Circuit building or MNA assembly failed for dimensionally inconsistent expression test: {e}")

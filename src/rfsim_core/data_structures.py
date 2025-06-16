@@ -2,14 +2,15 @@
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Set, TYPE_CHECKING
+from pathlib import Path # Added import
 
 logger = logging.getLogger(__name__)
 
 # Use TYPE_CHECKING to avoid circular imports for type hints
 if TYPE_CHECKING:
     from .parameters import ParameterManager # Forward declaration
-    # Add forward reference for ComponentBase if needed elsewhere
     from .components.base import ComponentBase
+
 
 @dataclass
 class Net:
@@ -39,7 +40,7 @@ class Port:
     component: 'Component'
     port_id: str | int
     net: Optional[Net] = None
-    original_yaml_net_name: Optional[str] = None # Added for SemanticValidator
+    original_yaml_net_name: Optional[str] = None
 
     def __post_init__(self):
          if not isinstance(self.port_id, (str, int)):
@@ -70,7 +71,6 @@ class Component:
         return self.instance_id == other.instance_id
 
     def add_port(self, port_id: str | int) -> 'Port':
-        """Creates and adds a port to this component."""
         if port_id in self.ports:
             raise ValueError(f"Duplicate port ID '{port_id}' used in definition of component '{self.instance_id}'")
         port = Port(component=self, port_id=port_id)
@@ -86,14 +86,22 @@ class Circuit:
     nets: Dict[str, Net] = field(default_factory=dict)
     external_ports: Dict[str, Net] = field(default_factory=dict)
     external_port_impedances: Dict[str, str] = field(default_factory=dict)
-    parameter_manager: Optional['ParameterManager'] = None # Use forward reference string
+    parameter_manager: Optional['ParameterManager'] = None
     ground_net_name: str = "gnd"
+    
+    source_file_path: Optional[Path] = None
+    hierarchical_id: str = "top" # Default to "top" for the root circuit.
+                                 # Will be overridden by CircuitBuilder for subcircuits.
 
     def __post_init__(self):
+        if not isinstance(self.hierarchical_id, str) or not self.hierarchical_id:
+            # This should ideally be caught by CircuitBuilder if it fails to set it.
+            raise ValueError(f"Circuit '{self.name}' must have a non-empty hierarchical_id.")
         try:
-            logger.info(f"Circuit object initialized: {self.name}")
+            logger.info(f"Circuit object initialized: {self.name} (Hierarchical ID: {self.hierarchical_id}, Source: {self.source_file_path})")
             self.get_or_create_net(self.ground_net_name, is_ground=True)
         except Exception as e:
+            logger.error(f"Error during Circuit __post_init__ for '{self.name}': {e}", exc_info=True)
             raise
 
     def add_component(self, component: Component):

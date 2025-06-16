@@ -1,1 +1,1 @@
-import rfsim_core as rfsim_core
+from .rfsim_core import *

@@ -25,17 +25,15 @@ class SemanticValidationError(ValueError):
         self.issues: List[ValidationIssue] = [
             issue for issue in issues if issue.level == ValidationIssueLevel.ERROR
         ]
-        # Removed the 'if not self.issues:' block as per review (dead code)
 
         if message is None:
             error_messages_list = []
-            for err in self.issues: # self.issues now guaranteed to contain only errors
+            for err in self.issues:
                 error_messages_list.append(
                     f"  - [{err.code}]: {err.message} (Component: {err.component_id or 'N/A'}, "
                     f"Net: {err.net_name or 'N/A'}, Param: {err.parameter_name or 'N/A'}, Details: {err.details or ''})"
                 )
-            # Ensure there are actual errors before claiming them in the message
-            if not self.issues: # Should not happen if run_sweep calls this correctly
+            if not self.issues:
                  summary_message = "SemanticValidationError raised unexpectedly with no error-level issues."
             else:
                  summary_message = (f"Semantic validation failed with {len(self.issues)} error(s):\n" +
@@ -184,13 +182,12 @@ class SemanticValidator:
 
     def _check_id_uniqueness(self):
         logger.debug("Executing _check_id_uniqueness...")
-        for comp_id_key in self.circuit.sim_components.keys(): # Corrected: Iterate circuit.components for raw data IDs
+        for comp_id_key in self.circuit.sim_components.keys():
             if not isinstance(comp_id_key, str) or not comp_id_key:
                 self._add_issue(
                     level=ValidationIssueLevel.ERROR,
                     code_enum=SemanticIssueCode.ID_COMP_INVALID_001,
                     component_id=str(comp_id_key)
-                    # **{'component_id': str(comp_id_key)} # Removed duplicate
                 )
         
         for net_name_key in self.circuit.nets.keys():
@@ -199,7 +196,6 @@ class SemanticValidator:
                     level=ValidationIssueLevel.ERROR,
                     code_enum=SemanticIssueCode.ID_NET_INVALID_001,
                     net_name=str(net_name_key)
-                    # **{'net_name': str(net_name_key)} # Removed duplicate
                 )
 
     def _check_registered_component_types(self):
@@ -211,7 +207,6 @@ class SemanticValidator:
                     level=ValidationIssueLevel.ERROR,
                     code_enum=SemanticIssueCode.COMP_TYPE_001,
                     component_id=comp_id,
-                    # **kwargs for message formatting and details (component_id removed)
                     unregistered_type=comp_type_str,
                     available_types=list(COMPONENT_REGISTRY.keys())
                 )
@@ -228,64 +223,79 @@ class SemanticValidator:
             comp_type_str_for_msg = ComponentClass.component_type_str
 
             try:
-                declared_ports_by_type = set(ComponentClass.declare_ports())
+                original_declared_ports_by_type = ComponentClass.declare_ports()
             except Exception as e:
                 logger.error(f"Error calling declare_ports() for type '{comp_type_str_for_msg}' (comp '{comp_id}'): {e}")
                 self._add_issue(
-                    level=ValidationIssueLevel.ERROR, 
-                    code_enum=SemanticIssueCode.COMP_PORT_DECL_FAIL_001, 
+                    level=ValidationIssueLevel.ERROR,
+                    code_enum=SemanticIssueCode.COMP_PORT_DECL_FAIL_001,
                     component_id=comp_id,
-                    # **kwargs (component_id removed)
                     component_type=comp_type_str_for_msg,
                     error_details=str(e)
                 )
-                continue
+                continue # Skip to the next component if declare_ports fails
 
-            used_ports_in_instance = set(raw_comp_data.ports.keys())
+            # For set operations, convert declared port IDs to strings
+            declared_ports_as_str_set = {str(p) for p in original_declared_ports_by_type}
 
-            extra_ports = used_ports_in_instance - declared_ports_by_type
-            if extra_ports:
+            instance_ports_map = raw_comp_data.ports # Dict[str|int, PortDataStructure]
+            # Get used port IDs with their original types (List[str|int])
+            actual_used_port_ids_in_instance = list(instance_ports_map.keys())
+
+            # Check for extra (undeclared) ports
+            # These are ports used in the instance but not declared by the component type
+            undeclared_ports_found = []
+            for p_used in actual_used_port_ids_in_instance:
+                if str(p_used) not in declared_ports_as_str_set:
+                    undeclared_ports_found.append(p_used) # Keep original type for reporting
+
+            if undeclared_ports_found:
                 self._add_issue(
-                    level=ValidationIssueLevel.ERROR, 
+                    level=ValidationIssueLevel.ERROR,
                     code_enum=SemanticIssueCode.PORT_DEF_001,
                     component_id=comp_id,
-                    # **kwargs (component_id removed)
                     component_type=comp_type_str_for_msg,
-                    extra_ports=list(extra_ports),
-                    declared_ports=list(declared_ports_by_type)
+                    extra_ports=undeclared_ports_found, # Report with original types
+                    declared_ports=original_declared_ports_by_type # Report with original types
                 )
 
-            missing_ports = declared_ports_by_type - used_ports_in_instance
-            if missing_ports:
+            # Check for missing ports
+            # These are ports declared by the component type but not used in the instance
+            missing_declared_ports_found = []
+            # For this check, convert used port IDs to strings for the set
+            used_port_ids_as_str_set = {str(p) for p in actual_used_port_ids_in_instance}
+            for p_decl in original_declared_ports_by_type:
+                if str(p_decl) not in used_port_ids_as_str_set:
+                    missing_declared_ports_found.append(p_decl) # Keep original type for reporting
+
+            if missing_declared_ports_found:
                 self._add_issue(
-                    level=ValidationIssueLevel.ERROR, 
+                    level=ValidationIssueLevel.ERROR,
                     code_enum=SemanticIssueCode.PORT_DEF_002,
                     component_id=comp_id,
-                    # **kwargs (component_id removed)
                     component_type=comp_type_str_for_msg,
-                    missing_ports=list(missing_ports),
-                    declared_ports=list(declared_ports_by_type)
+                    missing_ports=missing_declared_ports_found, # Report with original types
+                    declared_ports=original_declared_ports_by_type # Report with original types
                 )
 
-            for port_yaml_id, port_ds_obj in raw_comp_data.ports.items(): 
+            # Port linking/structural checks (original logic for PORT_UNLINKED_001, PORT_CONN_002)
+            for port_yaml_id, port_ds_obj in raw_comp_data.ports.items():
                 if port_ds_obj.net is None:
                     original_name = port_ds_obj.original_yaml_net_name or "<Original YAML net name not available>"
                     self._add_issue(
-                        level=ValidationIssueLevel.ERROR, 
+                        level=ValidationIssueLevel.ERROR,
                         code_enum=SemanticIssueCode.PORT_UNLINKED_001,
                         component_id=comp_id,
-                        # **kwargs (component_id removed)
-                        port_id=str(port_yaml_id),
+                        port_id=str(port_yaml_id), # Ensure port_id is string for template
                         original_net_name_from_yaml=original_name
                     )
                 elif port_ds_obj.net.name not in self.circuit.nets:
-                     self._add_issue(
-                        level=ValidationIssueLevel.ERROR, 
+                    self._add_issue(
+                        level=ValidationIssueLevel.ERROR,
                         code_enum=SemanticIssueCode.PORT_CONN_002,
                         component_id=comp_id,
                         net_name=port_ds_obj.net.name,
-                        # **kwargs (component_id, net_name removed)
-                        port_id=str(port_yaml_id)
+                        port_id=str(port_yaml_id) # Ensure port_id is string for template
                     )
 
     def _check_component_parameter_declarations(self):

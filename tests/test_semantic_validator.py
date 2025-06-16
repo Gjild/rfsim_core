@@ -3,16 +3,20 @@ import pytest
 import numpy as np
 import logging # For caplog
 
-from rfsim_core import (
+from src.rfsim_core import (
     NetlistParser, CircuitBuilder, SemanticValidator, SemanticValidationError,
     ValidationIssue, ValidationIssueLevel, SemanticIssueCode,
     Circuit, ComponentBase, ureg, Quantity, ParameterManager,
     run_sweep, ComponentError
 )
-from rfsim_core.components import COMPONENT_REGISTRY, Resistor, Capacitor, Inductor # Import concrete types for tests
-from rfsim_core.parameters import ParameterError # For specific exception checks
-from rfsim_core.components import register_component
+from src.rfsim_core.components import COMPONENT_REGISTRY, Resistor, Capacitor, Inductor # Import concrete types for tests
+from src.rfsim_core.parameters import ParameterError # For specific exception checks
+from src.rfsim_core.components import register_component
+from src.rfsim_core.components.base import DCBehaviorType
 from typing import List, Tuple, Dict, Any, Optional, ClassVar
+
+# Get a logger instance for the component, if it uses logging
+logger_comp = logging.getLogger(__name__ + ".DCCustomCompTest")
 
 # Default sweep for all YAML test cases to satisfy the parser
 DEFAULT_SWEEP_YAML = """
@@ -291,14 +295,51 @@ components:
     assert len(issues) == 3
 
 
-@register_component("BadPortDeclComp")
+@register_component("BadPortDeclComp") # Or however it's made available to the parser
 class BadPortDeclComp(ComponentBase):
-    component_type_str: ClassVar[str] = "BadPortDeclComp"
     @classmethod
-    def declare_parameters(cls) -> Dict[str, str]: return {"val": "ohm"}
+    def declare_parameters(cls) -> Dict[str, str]:
+        # Parameters as defined by your test case
+        return {"val": "ohm"} 
+
     @classmethod
-    def declare_ports(cls) -> List[str | int]: raise RuntimeError("Intentional port declaration failure")
-    def get_mna_stamps(self, freq_hz: np.ndarray, resolved_params: Dict[str, Quantity]) -> List[Any]: return []
+    def declare_ports(cls) -> List[str | int]:
+        # This is the method INTENDED to fail for the test scenario
+        raise RuntimeError("Intentional port declaration failure")
+
+    # Dummy implementation for get_mna_stamps, satisfying ComponentBase
+    # This method is called during AC simulation, not typically during semantic validation,
+    # but needs to be present for the class to be concrete.
+    def get_mna_stamps(self, freq_hz: np.ndarray, resolved_params: Dict[str, Quantity]):
+        # For a test component that's not meant to be fully simulated,
+        # returning an empty list of stamps is often sufficient.
+        # If your test setup for this component requires specific stamps (e.g., for other tests), adjust accordingly.
+        return []
+
+    # --- ADDED: Implementations for new Phase 7 abstract methods ---
+
+    def get_dc_behavior(self, resolved_params: Dict[str, Quantity]) -> Tuple[DCBehaviorType, Optional[Quantity]]:
+        """
+        Dummy DC behavior for test component.
+        Returning OPEN_CIRCUIT is a safe default for a component not fully modeled for DC.
+        """
+        # Example: assume 'val' is resistance for a more specific dummy behavior
+        # r_val_qty = resolved_params.get('val')
+        # if r_val_qty is not None and r_val_qty.magnitude[0] == 0:
+        #     return (DCBehaviorType.SHORT_CIRCUIT, None)
+        return (DCBehaviorType.OPEN_CIRCUIT, None)
+
+    def is_structurally_open(self, resolved_constant_params: Dict[str, Quantity]) -> bool:
+        """
+        Dummy structural open check for test component.
+        Returning False (not structurally open) is a safe default.
+        """
+        # Example:
+        # r_qty = resolved_constant_params.get('val')
+        # if r_qty is not None and np.isposinf(r_qty.magnitude):
+        #    return True
+        return False
+
 
 def test_component_port_declaration_failure():
     yaml_netlist = """
@@ -552,7 +593,7 @@ components:
             'net_name': 'p1',
             'parameter_name': 'bad_Z0_dim',
             'declared_dimension_of_ref': 'volt', 
-            'referenced_param_internal_name': 'global.bad_Z0_dim'
+            'referenced_param_internal_name': '_rfsim_global_.bad_Z0_dim'
         }
     )
     assert len(issues) == 1
@@ -646,23 +687,78 @@ ports:
         expected_details_subset={'component_id': 'C1', 'value_str': val_str_detail_fmt}
     )
 
-@register_component("DCCustomComp")
+@register_component("DCCustomComp") # This registers the component type string from YAML
 class DCCustomComp(ComponentBase):
-    component_type_str: ClassVar[str] = "DCCustomComp"
-    @classmethod
-    def declare_parameters(cls) -> Dict[str, str]: return {"mode": "dimensionless"}
-    @classmethod
-    def declare_ports(cls) -> List[str | int]: return ["p1", "p2"]
-    def get_mna_stamps(self, freq_hz: np.ndarray, resolved_params: Dict[str, Quantity]) -> List[Any]:
-        y = 1e-3 + 0j 
-        stamp_mag = np.array([[[y, -y],[-y, y]]], dtype=np.complex128)
-        return [(Quantity(stamp_mag, ureg.siemens), ["p1", "p2"])]
+    """
+    A concrete implementation of DCCustomComp for testing semantic validation
+    of custom DC behavior reporting.
+    """
+    component_type_str: str = "DCCustomComp" # Matches registration
 
+    @classmethod
+    def declare_parameters(cls) -> Dict[str, str]:
+        return {"mode": "dimensionless"} # Parameter 'mode' used in the test YAML
+
+    @classmethod
+    def declare_ports(cls) -> List[str | int]:
+        return ["p1", "p2"] # Ports 'p1', 'p2' used in the test YAML
+
+    def get_mna_stamps(self, freq_hz: np.ndarray, resolved_params: Dict[str, Quantity]) -> List[Tuple[Quantity, List[str | int]]]:
+        """Minimal implementation to satisfy ComponentBase abstraction."""
+        # This component doesn't need to produce MNA stamps for this specific semantic test.
+        return []
+
+    def get_dc_behavior(self, resolved_params: Dict[str, Quantity]) -> Tuple[DCBehaviorType, Optional[Quantity]]:
+        """Minimal implementation to satisfy ComponentBase abstraction."""
+        # Defaulting to OPEN_CIRCUIT for simplicity.
+        return (DCBehaviorType.OPEN_CIRCUIT, None)
+
+    def is_structurally_open(self, resolved_constant_params: Dict[str, Quantity]) -> bool:
+        """Minimal implementation to satisfy ComponentBase abstraction."""
+        # Defaulting to False for simplicity.
+        return False
+
+    # This is the method SemanticValidator looks for via hasattr
     def declare_dc_behavior(self, resolved_constant_params: Dict[str, Quantity]) -> Optional[List[Tuple[str, str, Dict[str, Any]]]]:
-        mode_val = resolved_constant_params.get("mode")
-        if mode_val is not None and mode_val.magnitude == 1:
-            # Make mode_val_detail a string for consistent detail types
-            return [("MYCOMP_DC_BEHAVIOR_001", f"Component is in special DC mode {mode_val.magnitude}", {"mode_val_detail": str(float(mode_val.magnitude))})]
+        """
+        Declares custom DC behavior information for SemanticValidator.
+        Returns a list of tuples: (issue_code_str, message_content, details_dict).
+        """
+        mode_qty = resolved_constant_params.get('mode')
+        if mode_qty is not None:
+            # Extract scalar magnitude robustly
+            mode_val_raw = mode_qty.magnitude
+            mode_val: float | int
+            if isinstance(mode_val_raw, np.ndarray):
+                if mode_val_raw.size == 1:
+                    mode_val = mode_val_raw.item()
+                else:
+                    logger_comp.warning(f"DCCustomComp '{self.instance_id}' mode parameter has unexpected array size: {mode_val_raw.shape}")
+                    return None # Or raise, or handle as error
+            else: # Assume scalar Python number
+                mode_val = mode_val_raw
+
+            if not isinstance(mode_val, (int, float, np.number)): # Check if it's a number
+                logger_comp.warning(f"DCCustomComp '{self.instance_id}' mode parameter is not a number: {mode_val} (type: {type(mode_val)})")
+                return None
+
+            # This is the "custom_message" part that SemanticValidator will use
+            # for the DC_CUSTOM_INFO_001 issue's template.
+            message_content_for_issue = f"Component is in special DC mode {int(mode_val)}"
+
+            # These are additional details that will be merged into the ValidationIssue.details field.
+            details_for_issue = {
+                'mode_val_detail': str(float(mode_val)) # e.g., "1.0"
+            }
+            
+            # Return a list, as per SemanticValidator's expectation for dc_behavior_reports
+            return [
+                (
+                    SemanticIssueCode.DC_CUSTOM_INFO_001.code, # The string code, e.g., "DC_CUSTOM_INFO_001"
+                    message_content_for_issue,
+                    details_for_issue
+                )
+            ]
         return None
 
 def test_dc_custom_behavior_info():

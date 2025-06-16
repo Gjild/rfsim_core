@@ -4,9 +4,9 @@ import yaml
 from pathlib import Path
 import logging # Import logging for caplog level setting
 
-from rfsim_core.parser import NetlistParser, SchemaValidationError, ParsingError
-from rfsim_core.data_structures import Circuit, Component, Net
-from rfsim_core.units import ureg
+from src.rfsim_core.parser import NetlistParser, SchemaValidationError, ParsingError
+from src.rfsim_core.data_structures import Circuit, Component, Net
+from src.rfsim_core.units import ureg
 
 # --- Fixtures for YAML Content ---
 
