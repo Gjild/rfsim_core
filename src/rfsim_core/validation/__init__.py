@@ -1,10 +1,11 @@
-# --- src/rfsim_core/validation/__init__.py ---
+# src/rfsim_core/validation/__init__.py
 import logging
 logger = logging.getLogger(__name__)
 
 from .issues import ValidationIssue, ValidationIssueLevel
 from .issue_codes import SemanticIssueCode
-from .semantic_validator import SemanticValidator, SemanticValidationError
+from .semantic_validator import SemanticValidator
+from .exceptions import SemanticValidationError
 
 __all__ = [
     "ValidationIssue",
@@ -13,5 +14,3 @@ __all__ = [
     "SemanticValidator",
     "SemanticValidationError",
 ]
-
-logger.info("RFSim Core Validation module initialized.")

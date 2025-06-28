@@ -1,243 +1,307 @@
-# --- src/rfsim_core/circuit_builder.py ---
+# src/rfsim_core/circuit_builder.py
 import logging
-from typing import Dict, Any, Optional, List, Tuple
-import copy
+from collections import ChainMap
+from typing import Dict, Any, List, Tuple, Set
 
-from .data_structures import Circuit
-from .data_structures import Component as ComponentData
-from .components.base import ComponentBase, COMPONENT_REGISTRY, ComponentError
-from .parameters import ParameterManager, ParameterError, ParameterDefinition, ParameterDefinitionError, ParameterScopeError, CircularParameterDependencyError
-from .units import ureg, pint, Quantity
+from .data_structures import Circuit, Net
+from .components.base import ComponentBase, COMPONENT_REGISTRY
+from .components.subcircuit import SubcircuitInstance
+from .parser.raw_data import (
+    ParsedCircuitNode,
+    ParsedLeafComponentData,
+    ParsedSubcircuitData,
+)
+from .parameters import (
+    ParameterManager,
+    ParameterDefinition,
+    ParameterDefinitionError,
+)
+from .errors import CircuitBuildError, Diagnosable, format_diagnostic_report
+
+
 logger = logging.getLogger(__name__)
 
-class CircuitBuildError(ValueError):
-    """Custom exception for errors during circuit building/processing."""
-    pass
 
 class CircuitBuilder:
     """
-    Takes parsed circuit data, builds the ParameterManager by collecting and
-    validating all parameter definitions, performs structural validation,
-    and instantiates simulation-ready component objects.
-    User-facing semantic error reporting for port/parameter mismatches is
-    deferred to SemanticValidator.
+    Synthesizes a simulation-ready, hierarchical `Circuit` object from a parsed IR tree.
+
+    This class implements the "Correctness by Construction" and "Explicit Contracts"
+    mandates by transforming the raw, unlinked `ParsedCircuitNode` IR from the
+    parser into a final, linked, and simulation-ready `Circuit` model.
+
+    The process is a strict, two-pass pipeline:
+    1.  **Definition Collection Pass:** Recursively traverses the entire IR tree to
+        discover all parameter definitions, handle hierarchical overrides, and build
+        the lexical scope maps (`ChainMap`) for every parameter. This pass produces a
+        flat list of all final `ParameterDefinition` objects.
+
+    2.  **Model Synthesis Pass:** With the parameters fully defined, this pass
+        recursively traverses the IR tree again to instantiate the final `Circuit`
+        and `ComponentBase` simulation objects, linking them to a single global
+        `ParameterManager` and performing ground net unification.
     """
-    def __init__(self):
-        self._ureg = ureg 
-        logger.info("CircuitBuilder initialized.")
 
-    def build_circuit(self, parsed_data: Circuit) -> Circuit:
-        logger.info(f"Building simulation-ready circuit '{parsed_data.name}'...")
+    def build_simulation_model(self, parsed_tree_root: ParsedCircuitNode) -> Circuit:
+        """
+        The main build-time entry point. Synthesizes the IR tree into a simulation model.
+        This method implements the top-level error handling for the entire build process.
 
+        Args:
+            parsed_tree_root: The root of the `ParsedCircuitNode` tree from the parser.
+
+        Returns:
+            The fully synthesized, simulation-ready, top-level `Circuit` object.
+
+        Raises:
+            CircuitBuildError: A user-facing, diagnosable error if any part of the
+                               build process fails.
+        """
+        logger.info(f"--- Starting circuit model synthesis for '{parsed_tree_root.circuit_name}' ---")
         try:
-            sim_circuit = Circuit(
-                name=parsed_data.name,
-                nets=copy.deepcopy(parsed_data.nets),
-                external_ports=copy.deepcopy(parsed_data.external_ports),
-                external_port_impedances=copy.deepcopy(parsed_data.external_port_impedances),
-                parameter_manager=None, 
-                ground_net_name=parsed_data.ground_net_name,
-                components=copy.deepcopy(parsed_data.components) # Store raw component data from parser
-            )
-            setattr(sim_circuit, 'sim_components', {}) # Initialize dict for simulation-ready components
-            raw_global_params = getattr(parsed_data, 'raw_global_parameters', {})
-            logger.debug(f"Created new Circuit object '{sim_circuit.name}' for simulation.")
+            # --- PASS 1: Collect all parameter definitions and build scopes ---
+            logger.debug("Starting Pass 1: Parameter Definition and Scope Collection...")
+            all_definitions, scope_maps = self._collect_and_scope_definitions(parsed_tree_root)
+            logger.debug("Pass 1 Complete. Collected %d final parameter definitions.", len(all_definitions))
+
+            # --- Instantiate and build the single, global ParameterManager ---
+            global_pm = ParameterManager()
+            global_pm.build(all_definitions, scope_maps)
+
+            # --- PASS 2: Synthesize the final simulation object tree ---
+            logger.debug("Starting Pass 2: Simulation Object Tree Synthesis...")
+            sim_circuit = self._synthesize_circuit_object_tree(parsed_tree_root, global_pm)
+            logger.debug("Pass 2 Complete. Final circuit object tree synthesized.")
+
+            logger.info(f"--- Circuit model synthesis for '{sim_circuit.name}' successful. ---")
+            return sim_circuit
+
+        except Diagnosable as e:
+            # Catch any well-defined, diagnosable error from the build process.
+            diagnostic_report = e.get_diagnostic_report()
+            raise CircuitBuildError(diagnostic_report) from e
+
         except Exception as e:
-            logger.error(f"Failed to create base simulation circuit object: {e}", exc_info=True)
-            raise CircuitBuildError(f"Failed to create base simulation circuit object: {e}") from e
-        
-        param_manager = ParameterManager()
-        all_definitions: List[ParameterDefinition] = []
-        
-        try:
-            all_definitions = self._collect_parameter_definitions(
-                parsed_data.components, # Use raw components from parsed_data
-                raw_global_params
+            # Catch all other unexpected errors for a graceful fallback report.
+            report = format_diagnostic_report(
+                error_type=f"An Unexpected Error Occurred ({type(e).__name__})",
+                details=f"The circuit builder encountered an unexpected internal error: {str(e)}",
+                suggestion="This may indicate a bug in RFSim Core. Please review the traceback, check for input errors, and if the problem persists, consider filing a bug report.",
+                context={}
             )
-            param_manager.add_definitions(all_definitions)
-            param_manager.build() 
-            sim_circuit.parameter_manager = param_manager 
-            logger.info(f"ParameterManager built successfully for '{sim_circuit.name}'.")
-            logger.debug(f"Parameter Manager State: {len(param_manager.get_all_internal_names())} params defined.")
+            raise CircuitBuildError(report) from e
 
-        except (ParameterError, ParameterDefinitionError, ComponentError, CircularParameterDependencyError) as e:
-            error_msg = f"Circuit build failed for '{parsed_data.name}' due to parameter error: {e}"
-            logger.error(error_msg, exc_info=False) 
-            raise CircuitBuildError(error_msg) from e
-        except Exception as e:
-            error_msg = f"Unexpected error during parameter manager setup for '{parsed_data.name}': {e}"
-            logger.error(error_msg, exc_info=True)
-            raise CircuitBuildError(error_msg) from e
-
-        processed_components: Dict[str, ComponentBase] = {}
-        internal_structure_errors: List[str] = [] 
-
-        # Iterate through raw component data stored on sim_circuit (copied from parsed_data)
-        for instance_id, comp_data in sim_circuit.components.items(): 
-            comp_type_str = comp_data.component_type
-            logger.debug(f"Building component '{instance_id}' of type '{comp_type_str}'")
-
-            if comp_type_str not in COMPONENT_REGISTRY:
-                logger.warning(f"Component '{instance_id}' uses unknown type '{comp_type_str}'. "
-                               f"No simulation object will be created for it. SemanticValidator should report this.")
-                # This is a semantic issue, not a CircuitBuildError for internal structure.
-                # SemanticValidator will pick this up based on raw comp_data.
-                continue # Skip creating a sim_component for this instance_id
-
-            ComponentClass = COMPONENT_REGISTRY[comp_type_str]
-
-            instance_internal_names = []
-            try:
-                declared_param_keys = ComponentClass.declare_parameters().keys()
-            except Exception as e:
-                internal_structure_errors.append(f"Critical error fetching parameter declarations for component type '{comp_type_str}' (instance '{instance_id}'): {e}. Cannot proceed with this component.")
-                continue 
-            
-            for param_name in declared_param_keys:
-                internal_name = f"{instance_id}.{param_name}"
-                try:
-                    param_manager.get_parameter_definition(internal_name) 
-                    instance_internal_names.append(internal_name)
-                except ParameterScopeError:
-                    logger.warning(f"Internal Note: Declared parameter '{param_name}' for component '{instance_id}' "
-                                   f"does not have a corresponding definition in ParameterManager ('{internal_name}'). "
-                                   f"This might be due to it being an undeclared parameter in YAML or a missing required one. "
-                                   f"SemanticValidator will report. Skipping this parameter for component instantiation.")
-            
-            try:
-                sim_component = ComponentClass(
-                    instance_id=instance_id,
-                    component_type=comp_type_str,
-                    parameter_manager=param_manager, 
-                    parameter_internal_names=instance_internal_names 
-                )
-                processed_components[instance_id] = sim_component
-                logger.debug(f"Successfully created simulation component: {sim_component!r}")
-            except (ComponentError, ValueError, TypeError) as e:
-                logger.error(f"Instantiation failed for component '{instance_id}': {e}. SemanticValidator may report further details.")
-                continue
-        
-        if internal_structure_errors: 
-            error_msg = f"Circuit build failed for '{parsed_data.name}' with {len(internal_structure_errors)} critical internal errors:\n- " + "\n- ".join(internal_structure_errors)
-            logger.error(error_msg)
-            raise CircuitBuildError(error_msg)
-        
-        sim_circuit.sim_components = processed_components # Assign the dict of created sim_components
-        logger.info(f"Successfully built circuit '{sim_circuit.name}'. Created {len(processed_components)} simulation-ready components.")
-        return sim_circuit 
-
-    def _collect_parameter_definitions(
+    def _collect_and_scope_definitions(
         self,
-        raw_components: Dict[str, ComponentData], # Takes raw component data
-        raw_global_params: Dict[str, Any]
-    ) -> List[ParameterDefinition]:
-        definitions = []
-        logger.debug("Collecting and validating parameter definitions...")
+        ir_node: ParsedCircuitNode,
+        parent_scope: ChainMap = ChainMap(),
+        parent_fqn: str = "top"
+    ) -> Tuple[List[ParameterDefinition], Dict[str, ChainMap]]:
+        """
+        Recursively performs Pass 1: collecting parameter definitions and building scopes.
 
-        for name, value_or_dict in raw_global_params.items():
-            expr_str: Optional[str] = None
-            const_str: Optional[str] = None
-            declared_dim_str: Optional[str] = None
+        This method walks the IR tree, creating `ParameterDefinition` objects and the
+        `ChainMap` lexical scopes needed for the `ExpressionPreprocessor`. It correctly
+        handles subcircuit parameter overrides by replacing definitions from the
+        sub-tree with new ones.
 
-            if isinstance(value_or_dict, dict): 
-                expr_str = value_or_dict.get('expression')
-                declared_dim_str = value_or_dict.get('dimension')
-                if not expr_str:
-                    raise ParameterDefinitionError(f"Global parameter '{name}' defined as dict but missing 'expression' key.")
-                if not declared_dim_str:
-                    raise ParameterDefinitionError(f"Global parameter '{name}' defined as expression ('{expr_str}') but missing mandatory 'dimension' key in YAML.")
-                logger.debug(f"Global expr param: {name}, expr='{expr_str}', declared_dim='{declared_dim_str}'")
-            else: 
-                const_str = str(value_or_dict)
-                try:
-                    qty = self._ureg.Quantity(const_str)
-                    if qty.dimensionless:
-                        declared_dim_str = "dimensionless"
-                    else:
-                        declared_dim_str = str(qty.units) 
-                    if not declared_dim_str and declared_dim_str != "dimensionless": # Ensure not empty string if not dimensionless
-                        # Attempt to re-parse units if initial str(qty.units) was empty (e.g. for pure numbers becoming dimensionless)
-                        # This path might not be strictly necessary if Pint handles it well, but defensive.
-                        pu = self._ureg.parse_units(str(qty.units))
-                        if pu == self._ureg.dimensionless:
-                            declared_dim_str = "dimensionless"
-                        else:
-                            declared_dim_str = str(pu) # Use Pint's canonical form
-                        if not declared_dim_str and declared_dim_str != "dimensionless":
-                             raise ValueError("Inferred unit string is empty or invalid after parsing.")
+        Args:
+            ir_node: The current `ParsedCircuitNode` being processed.
+            parent_scope: The lexical scope of the parent circuit.
+            parent_fqn: The fully qualified name of the parent context.
 
-                    logger.debug(f"Global const param: {name}, value='{const_str}', inferred_unit_str='{declared_dim_str}'")
-                except (pint.UndefinedUnitError, pint.DimensionalityError, ValueError, TypeError) as e:
-                    raise ParameterDefinitionError(f"Error parsing global constant parameter '{name}' value '{const_str}' to infer unit string: {e}") from e
-            try:
-                definitions.append(ParameterDefinition(
-                    name=name, scope='global', owner_id=None,
-                    expression_str=expr_str, constant_value_str=const_str,
-                    declared_dimension_str=declared_dim_str, is_value_provided=True
-                ))
-            except ValueError as e: 
-                raise ParameterDefinitionError(f"Invalid definition for global parameter '{name}': {e}")
-
-        for instance_id, comp_data in raw_components.items():
-            comp_type_str = comp_data.component_type
-            
-            # If component type is unknown, we can't get its declared parameters.
-            # SemanticValidator will report the unknown type. CircuitBuilder will skip sim_comp creation.
-            # Here, we should skip collecting param defs for this component to avoid crashing.
-            if comp_type_str not in COMPONENT_REGISTRY:
-                logger.debug(f"Skipping parameter definition collection for component '{instance_id}' due to unknown type '{comp_type_str}'.")
-                continue
-                
-            ComponentClass = COMPONENT_REGISTRY[comp_type_str] 
-            
-            try:
-                declared_params_spec = ComponentClass.declare_parameters()
-            except Exception as e:
-                 raise ComponentError(f"Failed to get parameter declarations from component type '{comp_type_str}' (instance '{instance_id}'): {e}") from e
-
-            raw_instance_params = comp_data.parameters 
-
-            for provided_param_name in raw_instance_params:
-                if provided_param_name not in declared_params_spec:
-                    logger.warning(f"Component '{instance_id}' (type '{comp_type_str}') provided parameter '{provided_param_name}' "
-                                   f"which is not declared by the component type. Declared: {list(declared_params_spec.keys())}. "
-                                   f"This parameter will be IGNORED by CircuitBuilder and reported by SemanticValidator.")
-            
-            for param_name, expected_dim_str in declared_params_spec.items():
-                raw_value_or_dict = raw_instance_params.get(param_name)
-                
-                is_value_provided_for_def = True
-                expr_str_for_def: Optional[str] = None
-                const_str_for_def: Optional[str] = None
-                
-                if raw_value_or_dict is None:
-                    logger.warning(f"Required parameter '{param_name}' for component instance '{instance_id}' (type '{comp_type_str}') "
-                                   f"is MISSING from YAML. A ParameterDefinition will be created without a value, "
-                                   f"and SemanticValidator will report this as an error.")
-                    is_value_provided_for_def = False
-                elif isinstance(raw_value_or_dict, dict): 
-                    expr_str_for_def = raw_value_or_dict.get('expression')
-                    yaml_dim = raw_value_or_dict.get('dimension') 
-                    if not expr_str_for_def:
-                         raise ParameterDefinitionError(f"Instance parameter '{instance_id}.{param_name}' defined as dict but missing 'expression' key.")
-                    if yaml_dim is not None:
-                         logger.warning(f"Instance parameter '{instance_id}.{param_name}' provided a 'dimension' key ('{yaml_dim}') in YAML. "
-                                        f"This is ignored; dimension '{expected_dim_str}' declared by component type '{comp_type_str}' is used.")
-                    logger.debug(f"Instance expr param: {instance_id}.{param_name}, expr='{expr_str_for_def}', declared_dim='{expected_dim_str}'")
-                else: 
-                    const_str_for_def = str(raw_value_or_dict)
-                    logger.debug(f"Instance const/ref param: {instance_id}.{param_name}, value='{const_str_for_def}', declared_dim='{expected_dim_str}'")
-
-                try:
-                    definitions.append(ParameterDefinition(
-                        name=param_name, scope='instance', owner_id=instance_id,
-                        expression_str=expr_str_for_def, 
-                        constant_value_str=const_str_for_def,
-                        declared_dimension_str=expected_dim_str, 
-                        is_value_provided=is_value_provided_for_def 
-                    ))
-                except ValueError as e: 
-                    raise ParameterDefinitionError(f"Invalid definition for instance parameter '{instance_id}.{param_name}': {e}")
+        Returns:
+            A tuple containing:
+            - A flat list of all final `ParameterDefinition` objects in this sub-tree.
+            - A dictionary mapping every parameter FQN to its correct `ChainMap` scope.
+        """
+        all_definitions: List[ParameterDefinition] = []
+        all_scope_maps: Dict[str, ChainMap] = {}
         
-        logger.info(f"Collected {len(definitions)} parameter definitions.")
-        return definitions
+        # The local scope map contains FQNs for parameters defined at this level.
+        local_scope_map: Dict[str, str] = {}
+        current_scope = parent_scope.new_child(local_scope_map)
+
+        # Process top-level parameters in the current circuit definition file
+        for name, value_str in ir_node.raw_parameters_dict.items():
+            param_def = ParameterDefinition(
+                owner_fqn=parent_fqn,
+                base_name=name,
+                raw_value_or_expression_str=str(value_str),
+                source_yaml_path=ir_node.source_yaml_path,
+                declared_dimension_str="dimensionless" # Interface params are dimensionless by convention
+            )
+            all_definitions.append(param_def)
+            local_scope_map[name] = param_def.fqn
+            all_scope_maps[param_def.fqn] = current_scope
+
+        # Process all components defined in this file
+        for comp_ir in ir_node.components:
+            component_fqn = f"{parent_fqn}.{comp_ir.instance_id}"
+            
+            if isinstance(comp_ir, ParsedLeafComponentData):
+                if comp_ir.component_type not in COMPONENT_REGISTRY:
+                    # This will be caught by SemanticValidator. We skip here to prevent a crash.
+                    logger.warning(f"Skipping parameter collection for '{component_fqn}' due to unknown type '{comp_ir.component_type}'.")
+                    continue
+                
+                ComponentClass = COMPONENT_REGISTRY[comp_ir.component_type]
+                declared_params = ComponentClass.declare_parameters()
+
+                for param_name, expected_dim in declared_params.items():
+                    if param_name in comp_ir.raw_parameters_dict:
+                        param_def = ParameterDefinition(
+                            owner_fqn=component_fqn,
+                            base_name=param_name,
+                            raw_value_or_expression_str=str(comp_ir.raw_parameters_dict[param_name]),
+                            source_yaml_path=comp_ir.source_yaml_path,
+                            declared_dimension_str=expected_dim
+                        )
+                        all_definitions.append(param_def)
+                        local_scope_map[f"{comp_ir.instance_id}.{param_name}"] = param_def.fqn
+                        all_scope_maps[param_def.fqn] = current_scope
+
+            elif isinstance(comp_ir, ParsedSubcircuitData):
+                # Recursively process the subcircuit's definition first
+                sub_definitions, sub_scope_maps = self._collect_and_scope_definitions(
+                    ir_node=comp_ir.sub_circuit_definition_node,
+                    parent_scope=current_scope,
+                    parent_fqn=component_fqn
+                )
+                
+                # Create a map from a parameter's base name (or deep name) within the subcircuit
+                # to its full definition object. This is crucial for finding the correct
+                # `declared_dimension_str` when applying an override.
+                sub_def_lookup: Dict[str, ParameterDefinition] = {
+                    p.fqn.replace(f"{component_fqn}.", "", 1): p for p in sub_definitions
+                }
+                
+                # Apply overrides from the instance definition
+                for override_key, override_value in comp_ir.raw_parameter_overrides.items():
+                    if override_key not in sub_def_lookup:
+                        # This error is intentionally detailed for clear user feedback.
+                        raise ParameterDefinitionError(
+                            fqn=f"{component_fqn}(override)",
+                            user_input=override_key,
+                            source_yaml_path=comp_ir.source_yaml_path,
+                            details=f"Subcircuit instance '{comp_ir.instance_id}' attempts to override parameter '{override_key}', which does not exist in its definition ('{comp_ir.definition_file_path.name}')."
+                        )
+                    
+                    # Found the original definition to override.
+                    original_def = sub_def_lookup[override_key]
+                    
+                    # Create the new definition for the override. It uses the new value but
+                    # crucially inherits the declared dimension from the original definition.
+                    override_def = ParameterDefinition(
+                        owner_fqn=original_def.owner_fqn,
+                        base_name=original_def.base_name,
+                        raw_value_or_expression_str=str(override_value),
+                        source_yaml_path=comp_ir.source_yaml_path, # Source is the overriding file
+                        declared_dimension_str=original_def.declared_dimension_str
+                    )
+                    
+                    # Replace the original definition with the override.
+                    # This ensures the final flat list is correct.
+                    sub_definitions = [d for d in sub_definitions if d.fqn != original_def.fqn]
+                    sub_definitions.append(override_def)
+
+                # Add the final, potentially overridden, sub-definitions to the main list.
+                all_definitions.extend(sub_definitions)
+                all_scope_maps.update(sub_scope_maps)
+
+        return all_definitions, all_scope_maps
+
+    def _synthesize_circuit_object_tree(
+        self,
+        ir_node: ParsedCircuitNode,
+        global_pm: ParameterManager,
+        parent_fqn: str = "top",
+        ground_unification_map: Dict[str, Net] = None
+    ) -> Circuit:
+        """
+        Recursively performs Pass 2: instantiating all simulation-ready objects.
+
+        This method walks the IR tree a second time, creating the final `Circuit`, `Net`,
+        and `ComponentBase` (including `SubcircuitInstance`) objects. It ensures that
+        all objects are correctly linked and that there is only one canonical ground `Net`
+        object for the entire simulation.
+
+        Args:
+            ir_node: The current `ParsedCircuitNode` being processed.
+            global_pm: The single, fully-built global ParameterManager.
+            parent_fqn: The FQN of the parent context.
+            ground_unification_map: A dict passed by reference to ensure a single
+                                    canonical ground `Net` object is used everywhere.
+
+        Returns:
+            The synthesized `Circuit` object for the current level of the hierarchy.
+        """
+        if ground_unification_map is None:
+            ground_unification_map = {}
+
+        # --- Synthesize Nets for this circuit level ---
+        nets: Dict[str, Net] = {}
+        raw_net_names = {comp.raw_ports_dict[p] for comp in ir_node.components if isinstance(comp, ParsedLeafComponentData) for p in comp.raw_ports_dict}
+        raw_net_names.update({p_map for comp in ir_node.components if isinstance(comp, ParsedSubcircuitData) for p_map in comp.raw_port_mapping.values()})
+        raw_net_names.add(ir_node.ground_net_name)
+        raw_port_nets = {p['id'] for p in ir_node.raw_external_ports_list}
+        raw_net_names.update(raw_port_nets)
+        
+        for net_name in sorted(list(raw_net_names)):
+            is_ground = (net_name == ir_node.ground_net_name)
+            if is_ground:
+                if "canonical_ground" not in ground_unification_map:
+                    # First time we've seen a ground net; create and store it.
+                    ground_unification_map["canonical_ground"] = Net(name=ir_node.ground_net_name, is_ground=True)
+                # All nets named 'gnd' (or the specified ground name) point to the same object.
+                nets[net_name] = ground_unification_map["canonical_ground"]
+            else:
+                nets[net_name] = Net(name=net_name, is_external=(net_name in raw_port_nets))
+
+        # --- Synthesize Components for this circuit level ---
+        sim_components: Dict[str, ComponentBase] = {}
+        for comp_ir in ir_node.components:
+            component_fqn = f"{parent_fqn}.{comp_ir.instance_id}"
+            
+            if isinstance(comp_ir, ParsedLeafComponentData):
+                if comp_ir.component_type in COMPONENT_REGISTRY:
+                    ComponentClass = COMPONENT_REGISTRY[comp_ir.component_type]
+                    sim_components[comp_ir.instance_id] = ComponentClass(
+                        instance_id=comp_ir.instance_id,
+                        parameter_manager=global_pm,
+                        parent_hierarchical_id=parent_fqn,
+                        raw_ir_data=comp_ir
+                    )
+            elif isinstance(comp_ir, ParsedSubcircuitData):
+                # Recursively synthesize the subcircuit's definition first.
+                sub_circuit_obj = self._synthesize_circuit_object_tree(
+                    ir_node=comp_ir.sub_circuit_definition_node,
+                    global_pm=global_pm,
+                    parent_fqn=component_fqn,
+                    ground_unification_map=ground_unification_map
+                )
+                
+                sim_components[comp_ir.instance_id] = SubcircuitInstance(
+                    instance_id=comp_ir.instance_id,
+                    parameter_manager=global_pm,
+                    sub_circuit_object_ref=sub_circuit_obj,
+                    sub_circuit_external_port_names_ordered=sorted(list(sub_circuit_obj.external_ports.keys())),
+                    parent_hierarchical_id=parent_fqn,
+                    raw_ir_data=comp_ir
+                )
+
+        # --- Synthesize the final Circuit object for this level ---
+        external_ports = {p['id']: nets[p['id']] for p in ir_node.raw_external_ports_list}
+
+        circuit_obj = Circuit(
+            name=ir_node.circuit_name,
+            hierarchical_id=parent_fqn,
+            source_file_path=ir_node.source_yaml_path,
+            ground_net_name=ir_node.ground_net_name,
+            nets=nets,
+            sim_components=sim_components,
+            external_ports=external_ports,
+            parameter_manager=global_pm,
+            raw_ir_root=ir_node
+        )
+        return circuit_obj

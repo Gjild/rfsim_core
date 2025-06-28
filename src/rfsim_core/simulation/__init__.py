@@ -1,15 +1,26 @@
-# --- src/rfsim_core/simulation/__init__.py ---
-from .mna import MnaAssembler, MnaInputError
-from .solver import solve_mna_system, factorize_mna_matrix, SingularMatrixError
-from .execution import run_simulation, run_sweep, SimulationError
+# src/rfsim_core/simulation/__init__.py
+from .exceptions import (
+    MnaInputError,
+    ComponentError,
+    DCAnalysisError,
+    SingularMatrixError,
+    SingleLevelSimulationFailure,
+)
+from .mna import MnaAssembler
+from .solver import solve_mna_system, factorize_mna_matrix
+from .execution import run_simulation, run_sweep
 
 __all__ = [
-    "MnaAssembler",
+    # Exceptions
     "MnaInputError",
+    "ComponentError",
+    "DCAnalysisError",
+    "SingularMatrixError",
+    "SingleLevelSimulationFailure",
+    # Core Classes
+    "MnaAssembler",
     "solve_mna_system",
     "factorize_mna_matrix",
-    "SingularMatrixError",
     "run_simulation",
     "run_sweep",
-    "SimulationError",
 ]

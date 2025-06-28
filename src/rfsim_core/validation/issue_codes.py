@@ -1,9 +1,10 @@
-# --- src/rfsim_core/validation/issue_codes.py ---
+# src/rfsim_core/validation/issue_codes.py
 import logging
 from enum import Enum
 from typing import Tuple
 
 logger = logging.getLogger(__name__)
+
 
 class SemanticIssueCode(Enum):
     """
@@ -13,53 +14,40 @@ class SemanticIssueCode(Enum):
 
     # --- Net Connectivity Issues (NET_CONN_...) ---
     NET_CONN_001 = ("NET_CONN_001", "Internal net '{net_name}' is defined but has no component connections (completely floating).")
-    NET_CONN_002 = ("NET_CONN_002", "Internal net '{net_name}' has only a single component connection (stub connection). Connected to component '{connected_to_component}' port '{connected_to_port}'.")
+    NET_CONN_002 = ("NET_CONN_002", "Internal net '{net_name}' has only a single connection to component '{connected_to_component}' port '{connected_to_port}'.")
 
-    # --- Component Type Issues (COMP_TYPE_...) ---
-    COMP_TYPE_001 = ("COMP_TYPE_001", "Component '{component_id}' specifies an unregistered type '{unregistered_type}'. Available types: {available_types}.")
-
-    # --- Port Definition Issues (PORT_DEF_...) ---
-    PORT_DEF_001 = ("PORT_DEF_001", "Component '{component_id}' (type '{component_type}') uses undeclared port(s): {extra_ports}. Declared ports are: {declared_ports}.")
-    PORT_DEF_002 = ("PORT_DEF_002", "Component '{component_id}' (type '{component_type}') is missing required connections for port(s): {missing_ports}. All declared ports are: {declared_ports}.")
-    COMP_PORT_DECL_FAIL_001 = ("COMP_PORT_DECL_FAIL_001", "Failed to retrieve port declarations for component type '{component_type}' (instance '{component_id}'): {error_details}.") # NEW
-
-    # --- Port Connection Issues (PORT_CONN_...) ---
-    PORT_UNLINKED_001 = ("PORT_UNLINKED_001", "Port '{port_id}' on component '{component_id}' is not linked to any net object. The YAML specified net name '{original_net_name_from_yaml}' for this port, which might be undefined or an internal error occurred during net assignment.")
-    PORT_CONN_002 = ("PORT_CONN_002", "Port '{port_id}' on component '{component_id}' connects to net '{net_name}', but this net object is not registered in the circuit's net dictionary. This indicates a severe internal inconsistency.")
+    # --- Component Type & Port Issues (COMP_...) ---
+    COMP_TYPE_001 = ("COMP_TYPE_001", "Component '{component_fqn}' specifies an unregistered type '{component_type}'. Available types: {available_types}.")
+    COMP_LEAF_PORT_DEF_UNDECLARED = ("COMP_LEAF_PORT_DEF_UNDECLARED", "Component '{component_fqn}' uses undeclared port(s): {extra_ports}. Declared ports are: {declared_ports}.")
+    COMP_LEAF_PORT_DEF_MISSING = ("COMP_LEAF_PORT_DEF_MISSING", "Component '{component_fqn}' is missing required connections for port(s): {missing_ports}. All declared ports are: {declared_ports}.")
 
     # --- External Port Issues (EXT_PORT_...) ---
     EXT_PORT_001 = ("EXT_PORT_001", "External port '{net_name}' cannot be the ground net.")
     EXT_PORT_002 = ("EXT_PORT_002", "External port net '{net_name}' has no component connections.")
-    EXT_PORT_003 = ("EXT_PORT_003", "External port '{net_name}' reference impedance (Z0) string is missing or empty.")
-    EXT_PORT_DIM_001 = ("EXT_PORT_DIM_001", "External port '{net_name}' Z0 literal '{value}' (parsed with dimensionality '{parsed_dimensionality}') is not dimensionally compatible with ohms.")
-    EXT_PORT_REF_001 = ("EXT_PORT_REF_001", "External port '{net_name}' Z0 reference '{parameter_name}' does not match any defined global parameter.")
-    EXT_PORT_REF_DIM_001 = ("EXT_PORT_REF_DIM_001", "External port '{net_name}' Z0 references global parameter '{parameter_name}' whose declared dimension ('{declared_dimension_of_ref}') is not compatible with ohms.")
-    EXT_PORT_REF_VALIDATE_FAIL_001 = ("EXT_PORT_REF_VALIDATE_FAIL_001", "External port '{net_name}' Z0 reference '{parameter_name}' could not be validated due to an unexpected internal error: {error_details}.") # NEW
+    EXT_PORT_Z0_MISSING = ("EXT_PORT_Z0_MISSING", "External port '{net_name}' reference impedance (Z0) string is missing or empty.")
+    EXT_PORT_Z0_DIM_MISMATCH = ("EXT_PORT_Z0_DIM_MISMATCH", "External port '{net_name}' Z0 literal '{value}' has dimensionality '{parsed_dimensionality}', which is not compatible with ohms.")
 
-    # --- Ground Net Issues (GND_CONN_...) ---
+    # --- Ground Net Issues (GND_...) ---
     GND_CONN_001 = ("GND_CONN_001", "Ground net '{net_name}' has no component connections, although components exist in the circuit.")
 
-    # --- Component Parameter Dimensionality Issues (PARAM_DIM_...) ---
-    PARAM_DIM_001 = ("PARAM_DIM_001", "Parameter '{parameter_name}' for component '{component_id}' has a declared dimension ('{declared_in_pm}') in the ParameterManager that is inconsistent with the dimension ('{expected_by_comp_type}') expected by its component type '{component_type}'.")
-    PARAM_VAL_DIM_001 = ("PARAM_VAL_DIM_001", "Constant value for parameter '{parameter_name}' of component '{component_id}' (resolved to {resolved_value_str}) is not dimensionally compatible with the expected dimension '{expected_dim_str}'. Its resolved dimensionality is '{resolved_value_dim}'.")
-    PARAM_CONST_VALIDATE_FAIL_001 = ("PARAM_CONST_VALIDATE_FAIL_001", "Failed to validate constant value for parameter '{parameter_name}' of component '{component_id}' due to an unexpected internal error: {error_details}. Expected dimension: '{expected_dim_str}'.") # NEW
+    # --- Leaf Component Parameter Issues (PARAM_...) ---
+    PARAM_LEAF_UNDCL = ("PARAM_LEAF_UNDCL", "Component '{component_fqn}' defines parameter '{parameter_name}' which is not declared by its type. Declared parameters are: {declared_params}.")
+    PARAM_LEAF_MISSING = ("PARAM_LEAF_MISSING", "Component '{component_fqn}' is missing required parameter '{parameter_name}'. All declared parameters are: {declared_params}.")
+    PARAM_LEAF_DIM_MISMATCH = ("PARAM_LEAF_DIM_MISMATCH", "Constant value for parameter '{parameter_name}' of component '{component_fqn}' (resolved to '{resolved_value_str}') is not dimensionally compatible with the expected dimension '{expected_dim_str}'.")
 
-    # --- Ideal DC Path Identification Info (DC_...) ---
-    DC_SHORT_R0_001 = ("DC_SHORT_R0_001", "Component '{component_id}' (Resistor) has resistance R=0 ({value_str}). Will be treated as an ideal DC short in DC analysis.")
-    DC_SHORT_L0_001 = ("DC_SHORT_L0_001", "Component '{component_id}' (Inductor) has inductance L=0 ({value_str}). Will be treated as an ideal DC short in DC analysis.")
-    DC_OPEN_LINF_001 = ("DC_OPEN_LINF_001", "Component '{component_id}' (Inductor) has inductance L=inf ({value_str}). Will be treated as an ideal DC open in DC analysis.")
-    DC_SHORT_CINF_001 = ("DC_SHORT_CINF_001", "Component '{component_id}' (Capacitor) has capacitance C=inf ({value_str}). Will be treated as an ideal DC short in DC analysis.")
-    DC_OPEN_C0_001 = ("DC_OPEN_C0_001", "Component '{component_id}' (Capacitor) has capacitance C=0 ({value_str}). Will be treated as an ideal DC open in DC analysis.")
-    DC_CUSTOM_INFO_001 = ("DC_CUSTOM_INFO_001", "Component '{component_id}' (type '{component_type}') reports custom DC behavior: {custom_message}.") # Message is fully formed by component
+    # --- Subcircuit Instantiation Issues (SUB_INST_...) ---
+    SUB_INST_PORT_MAP_UNDECLARED = ("SUB_INST_PORT_MAP_UNDECLARED", "Subcircuit instance '{instance_fqn}' maps port '{undeclared_sub_port_name}', which is not an external port of its definition '{sub_def_name}'. Available ports: {available_sub_ports}.")
+    SUB_INST_PORT_MAP_MISSING = ("SUB_INST_PORT_MAP_MISSING", "Subcircuit instance '{instance_fqn}' fails to map required external port(s) from its definition '{sub_def_name}': {missing_sub_ports}.")
+    SUB_INST_PORT_MAP_REQUIRED = ("SUB_INST_PORT_MAP_REQUIRED", "Subcircuit instance '{instance_fqn}' must include a 'ports' block because its definition '{sub_def_name}' declares external ports.")
+    SUB_INST_PARAM_OVERRIDE_UNDECLARED = ("SUB_INST_PARAM_OVERRIDE_UNDECLARED", "Subcircuit instance '{instance_fqn}' attempts to override parameter '{override_target_in_sub}', which does not exist in the subcircuit definition.")
+    SUB_INST_PARAM_OVERRIDE_DIM_MISMATCH = ("SUB_INST_PARAM_OVERRIDE_DIM_MISMATCH", "Subcircuit instance '{instance_fqn}' provides override value '{override_value_str}' for parameter '{override_target_in_sub}'. The value's dimension ('{provided_dim_str}') is incompatible with the parameter's declared dimension ('{expected_dim_str}').")
 
-    # --- ID Uniqueness/Validity (ID_...) ---
-    ID_COMP_INVALID_001 = ("ID_COMP_INVALID_001", "Invalid component ID '{component_id}' (found to be None or empty string in circuit.sim_components). This indicates a severe internal inconsistency during circuit building.")
-    ID_NET_INVALID_001 = ("ID_NET_INVALID_001", "Invalid net name '{net_name}' (found to be None or empty string in circuit.nets). This indicates an internal inconsistency or a problem during net creation.")
-
-    # --- Undeclared/Missing Instance Parameters (PARAM_INST_...) ---
-    PARAM_INST_UNDCL_001 = ("PARAM_INST_UNDCL_001", "Component '{component_id}' (type '{component_type}') defines parameter '{parameter_name}' which is not declared by the component type. Declared parameters are: {declared_params}.")
-    PARAM_INST_MISSING_001 = ("PARAM_INST_MISSING_001", "Component '{component_id}' (type '{component_type}') is missing required parameter '{parameter_name}'. All declared parameters are: {declared_params}.")
-
+    # --- Ideal DC Path Identification Info (DC_INFO_...) ---
+    DC_INFO_SHORT_R0 = ("DC_INFO_SHORT_R0", "Component '{component_fqn}' (Resistor) with value {value_str} will be treated as an ideal DC short.")
+    DC_INFO_SHORT_L0 = ("DC_INFO_SHORT_L0", "Component '{component_fqn}' (Inductor) with value {value_str} will be treated as an ideal DC short.")
+    DC_INFO_OPEN_LINF = ("DC_INFO_OPEN_LINF", "Component '{component_fqn}' (Inductor) with value {value_str} will be treated as an ideal DC open.")
+    DC_INFO_SHORT_CINF = ("DC_INFO_SHORT_CINF", "Component '{component_fqn}' (Capacitor) with value {value_str} will be treated as an ideal DC short.")
+    DC_INFO_OPEN_C0 = ("DC_INFO_OPEN_C0", "Component '{component_fqn}' (Capacitor) with value {value_str} will be treated as an ideal DC open.")
 
     @property
     def code(self) -> str:
