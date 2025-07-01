@@ -16,6 +16,15 @@ from .exceptions import (
 from ..data_structures import Circuit
 from ..units import ureg
 from ..components.subcircuit import SubcircuitInstance
+
+# --- BEGIN Phase 9 Task 5 Change ---
+# NEW IMPORT: Import the IMnaContributor protocol.
+# This import is the cornerstone of the decoupling. The execution engine now depends on
+# an abstract interface (the Protocol), not a concrete component base class method. This
+# fulfills the "Decoupling through Queryable Interfaces" mandate.
+from ..components.capabilities import IMnaContributor
+# --- END Phase 9 Task 5 Change ---
+
 from ..constants import LARGE_ADMITTANCE_SIEMENS
 from ..analysis_tools import DCAnalyzer, TopologyAnalyzer
 from ..parameters import ParameterManager, ParameterError
@@ -125,17 +134,57 @@ def _run_single_level_simulation(
         num_ac_ports = len(ac_port_names_ordered)
         y_matrices = np.full((len(freq_array_hz), num_ac_ports, num_ac_ports), np.nan + 0j, dtype=np.complex128)
 
-        # --- Vectorized Pre-computation Step ---
+        # --- BEGIN Phase 9 Task 5 Change: Refactored Vectorized Pre-computation Step ---
+        
+        # This step remains the same: all parameters are evaluated once for the entire sweep.
         logger.debug(f"[{circuit.hierarchical_id}] Evaluating all parameters for the full frequency sweep...")
         all_evaluated_params = circuit.parameter_manager.evaluate_all(freq_array_hz)
         
-        logger.debug(f"[{circuit.hierarchical_id}] Pre-computing all vectorized MNA stamps...")
+        logger.debug(f"[{circuit.hierarchical_id}] Pre-computing all vectorized MNA stamps via capabilities...")
         all_stamps_vectorized: Dict[str, List[StampInfo]] = {}
+        
+        # This loop is the heart of the "CRITICAL CORRECTION". It iterates through the
+        # components ONCE, before the per-frequency loop, to gather all vectorized stamps.
         for comp_fqn, sim_comp in assembler.effective_sim_components.items():
-            all_stamps_vectorized[comp_fqn] = sim_comp.get_mna_stamps(freq_array_hz, all_evaluated_params)
+            # STEP 1: Query for the capability.
+            # This is the decoupled query. We ask "Can you contribute to MNA?" instead
+            # of assuming `sim_comp.get_mna_stamps` exists.
+            mna_contributor = sim_comp.get_capability(IMnaContributor)
+            
+            if mna_contributor:
+                # STEP 2: If the capability exists, call its method.
+                # The call is wrapped in a try/except block to provide robust, contextual
+                # diagnostics if a component's implementation fails.
+                try:
+                    # The contract here is critical:
+                    #   - The `sim_comp` instance is passed as context.
+                    #   - The full `freq_array_hz` is passed.
+                    #   - The capability is expected to perform a single, vectorized calculation.
+                    # This fulfills the "Explicit and Vectorized Context Passing" mandate.
+                    stamps = mna_contributor.get_mna_stamps(
+                        sim_comp, freq_array_hz, all_evaluated_params
+                    )
+                    all_stamps_vectorized[comp_fqn] = stamps
+                except Exception as e:
+                    # Wrap any failure in a diagnosable, contextual error. This provides
+                    # clear feedback to the user, pinpointing the failing component.
+                    raise ComponentError(component_fqn=comp_fqn, details=f"Failed during vectorized MNA stamp computation: {e}") from e
+            else:
+                # STEP 3: If the capability does not exist, log it and move on.
+                # This makes the system robust to components that are not MNA-aware (e.g.,
+                # future non-electrical components). The assembler will correctly skip it as
+                # its FQN will not be in the `all_stamps_vectorized` dictionary.
+                logger.debug(f"Component '{comp_fqn}' does not provide IMnaContributor capability. Skipping MNA contribution.")
+                
         logger.debug(f"[{circuit.hierarchical_id}] All vectorized stamps pre-computed.")
 
+        # --- END Phase 9 Task 5 Change ---
+
         # --- Main Frequency Loop (Lean Assembly) ---
+        # Crucially, this loop and its call to `assembler.assemble` REMAIN UNCHANGED
+        # from Phase 8. The assembler's role is now simply to slice the pre-computed
+        # vectorized data for the current frequency index. This preserves the high-performance
+        # architecture.
         for idx, freq_val_hz in enumerate(freq_array_hz):
             try:
                 if np.isclose(freq_val_hz, 0.0):
@@ -246,4 +295,4 @@ def _compute_subcircuit_cache_key(
     frequency_array_tuple = tuple(np.sort(np.unique(freq_array_hz)))
     
     # The final, correct, and robust cache key.
-    return (def_path_str, canonical_overrides_tuple, external_context_tuple, frequency_array_tuple)
+    return (def_path_str, canonical_overrides_tuple, external_context_tuple, frequency_array_tuple) 

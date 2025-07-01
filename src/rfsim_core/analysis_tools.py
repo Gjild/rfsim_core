@@ -20,18 +20,35 @@ import numpy as np
 from scipy.linalg import lu_factor, lu_solve
 
 from .data_structures import Circuit
+
+# --- BEGIN Phase 9 Task 5 Change ---
+# Import the ComponentBase and DCBehaviorType (which is now in a separate file)
 from .components.base import ComponentBase, DCBehaviorType, ComponentError
+# NEW IMPORT: Import the IDcContributor protocol to enable decoupled DC analysis.
+from .components.capabilities import IDcContributor
+# --- END Phase 9 Task 5 Change ---
+
 from .components.subcircuit import SubcircuitInstance
 from .units import ureg, Quantity
 from .parameters import ParameterManager, ParameterError
 from .parser.raw_data import ParsedLeafComponentData
 
+# --- BEGIN Phase 9 Task 5 Thoughtful Enhancement ---
+# NEW IMPORT: Import the diagnosable DCAnalysisError from the simulation exceptions module.
+# This replaces the local, non-diagnosable ValueError subclass, aligning the DCAnalyzer
+# with the project's "Actionable Diagnostics" mandate for consistent, rich error reporting.
+from .simulation.exceptions import DCAnalysisError
+# --- END Phase 9 Task 5 Thoughtful Enhancement ---
+
 logger = logging.getLogger(__name__)
 
 
-class DCAnalysisError(ValueError):
-    """Custom exception for errors during rigorous DC analysis."""
-    pass
+# --- BEGIN Phase 9 Task 5 Thoughtful Enhancement ---
+# DELETED: The local, non-diagnosable DCAnalysisError class is removed.
+# class DCAnalysisError(ValueError):
+#     """Custom exception for errors during rigorous DC analysis."""
+#     pass
+# --- END Phase 9 Task 5 Thoughtful Enhancement ---
 
 
 class DCAnalyzer:
@@ -102,17 +119,37 @@ class DCAnalyzer:
         try:
             all_dc_params = self.parameter_manager.evaluate_all(np.array([0.0]))
         except ParameterError as e:
-            raise DCAnalysisError(f"Failed to evaluate parameters for DC analysis: {e}") from e
+            raise DCAnalysisError(hierarchical_context=self.circuit.hierarchical_id, details=f"Failed to evaluate parameters for DC analysis: {e}") from e
 
         dc_behaviors: Dict[str, Tuple[DCBehaviorType, Optional[Quantity]]] = {}
+        
+        # --- BEGIN Phase 9 Task 5 Change: Refactored DC Behavior Collection ---
         for comp_id, sim_comp in self.circuit.sim_components.items():
             try:
-                behavior_type, admittance_qty = sim_comp.get_dc_behavior(all_dc_params)
-                dc_behaviors[comp_id] = (behavior_type, admittance_qty)
+                # STEP 1: Query for the DC capability.
+                dc_contributor = sim_comp.get_capability(IDcContributor)
+                
+                if dc_contributor:
+                    # STEP 2: If capability exists, call its method.
+                    # The `sim_comp` instance is passed as context.
+                    behavior_type, admittance_qty = dc_contributor.get_dc_behavior(sim_comp, all_dc_params)
+                    dc_behaviors[comp_id] = (behavior_type, admittance_qty)
+                else:
+                    # STEP 3: If no capability, apply a robust default.
+                    # This makes the system extensible. A future non-electrical component, for example,
+                    # can be added without needing a `get_dc_behavior` method; it will safely be
+                    # treated as an open circuit in the DC analysis.
+                    dc_behaviors[comp_id] = (DCBehaviorType.OPEN_CIRCUIT, None)
+                    
             except (ComponentError, KeyError) as e:
-                err_msg = f"Error getting DC behavior for '{sim_comp.fqn}': {e}"
-                logger.error(err_msg, exc_info=True)
-                raise DCAnalysisError(err_msg) from e
+                # The exception is now wrapped in the richer, diagnosable DCAnalysisError.
+                details = f"Error getting DC behavior for component '{sim_comp.fqn}': {e}"
+                logger.error(details, exc_info=True)
+                raise DCAnalysisError(
+                    hierarchical_context=self.circuit.hierarchical_id,
+                    details=details
+                ) from e
+        # --- END Phase 9 Task 5 Change ---
         return dc_behaviors
 
     def _build_dc_supernode_graph(self, dc_behaviors: Dict[str, Tuple[DCBehaviorType, Optional[Quantity]]]):
@@ -122,17 +159,12 @@ class DCAnalyzer:
         self._supernode_graph.add_nodes_from(self.circuit.nets.keys())
 
         for comp_id, (behavior_type, _) in dc_behaviors.items():
-            # This loop correctly processes ONLY leaf components that have explicitly
-            # reported they are ideal shorts. Subcircuits, which never report
-            # SHORT_CIRCUIT, are correctly and implicitly ignored here.
             if behavior_type != DCBehaviorType.SHORT_CIRCUIT:
                 continue
 
             sim_comp = self.circuit.sim_components[comp_id]
             raw_comp_data = sim_comp.raw_ir_data
             
-            # This assertion enforces the internal contract. A SubcircuitInstance will
-            # never report as a short, so this block is only for leaf components.
             if not isinstance(raw_comp_data, ParsedLeafComponentData):
                 logger.error(
                     f"Internal contract violation: Component '{sim_comp.fqn}' reported as a DC "
@@ -146,13 +178,12 @@ class DCAnalyzer:
             ]
 
             if len(connected_nets) >= 2:
-                # Add edges between all pairs of nets connected to the shorting component.
                 for net1, net2 in combinations(sorted(list(set(connected_nets))), 2):
                     self._supernode_graph.add_edge(net1, net2, type='dc_short', component_id=comp_id)
 
     def _identify_supernodes(self):
         """Finds connected components in the shorting graph to define supernodes."""
-        if self._supernode_graph is None: raise DCAnalysisError("Supernode graph was not built.")
+        if self._supernode_graph is None: raise DCAnalysisError(hierarchical_context=self.circuit.hierarchical_id, details="Supernode graph was not built.")
         self._supernode_map = {net: net for net in self.circuit.nets}
         for component_nets in nx.connected_components(self._supernode_graph):
             is_gnd_component = self.ground_net_name in component_nets
@@ -163,11 +194,10 @@ class DCAnalyzer:
 
     def _assign_dc_mna_indices(self):
         """Assigns a unique integer index to each supernode for MNA matrix assembly."""
-        if not self._supernode_map: raise DCAnalysisError("Supernode map not populated.")
-        if self._ground_supernode_representative_name is None: raise DCAnalysisError("Ground supernode not identified.")
+        if not self._supernode_map: raise DCAnalysisError(hierarchical_context=self.circuit.hierarchical_id, details="Supernode map not populated.")
+        if self._ground_supernode_representative_name is None: raise DCAnalysisError(hierarchical_context=self.circuit.hierarchical_id, details="Ground supernode not identified.")
         
         representatives = sorted(list(set(self._supernode_map.values())))
-        # Ground supernode is always index 0.
         self._supernode_to_mna_index_map = {self._ground_supernode_representative_name: 0}
         idx_counter = 1
         for rep in representatives:
@@ -187,7 +217,6 @@ class DCAnalyzer:
 
             sim_comp = self.circuit.sim_components[comp_id]
             if isinstance(sim_comp, SubcircuitInstance):
-                # Subcircuits contribute an N-port admittance matrix.
                 y_sub_mag = admittance_qty.to(self.ureg.siemens).magnitude
                 port_map = sim_comp.raw_ir_data.raw_port_mapping
                 parent_indices = [
@@ -198,7 +227,6 @@ class DCAnalyzer:
                     for j, c_idx in enumerate(parent_indices):
                         y_dc_super_full[r_idx, c_idx] += y_sub_mag[i, j]
             else:
-                # Leaf components contribute a scalar admittance.
                 y_mag = complex(admittance_qty.to(self.ureg.siemens).magnitude)
                 raw_comp = sim_comp.raw_ir_data
                 nets = [net for net in raw_comp.raw_ports_dict.values() if net in self.circuit.nets]
@@ -219,7 +247,6 @@ class DCAnalyzer:
              srep = self.get_supernode_representative_name(port_name)
              if srep is not None and not self.is_ground_supernode_by_representative(srep):
                  supernode_rep_to_ac_ports.setdefault(srep, []).append(port_name)
-        # If multiple AC ports merge into one DC supernode, pick the first alphabetically as the representative DC port.
         self._dc_port_names_ordered = [sorted(ports)[0] for _, ports in sorted(supernode_rep_to_ac_ports.items())]
 
     def _calculate_dc_y_parameters(self, y_dc_super_full: np.ndarray) -> Optional[Quantity]:
@@ -241,7 +268,7 @@ class DCAnalyzer:
             y_ports_dc_mag = Y_PP - (Y_PI @ X)
             return Quantity(y_ports_dc_mag, self.ureg.siemens)
         except np.linalg.LinAlgError as e:
-            raise DCAnalysisError(f"Failed to compute DC Schur complement: {e}") from e
+            raise DCAnalysisError(hierarchical_context=self.circuit.hierarchical_id, details=f"Failed to compute DC Schur complement: {e}") from e
 
     def _build_dc_port_mapping(self) -> Dict[str, Optional[int]]:
         """Creates a map from original AC port names to their corresponding DC port indices."""
@@ -251,7 +278,6 @@ class DCAnalyzer:
         for ac_port in self.circuit.external_ports:
             srep = self.get_supernode_representative_name(ac_port)
             if srep is None or self.is_ground_supernode_by_representative(srep):
-                # AC port is shorted to ground at DC.
                 dc_port_mapping[ac_port] = None
             else:
                 port_name = srep_to_port_name.get(srep)
@@ -267,11 +293,7 @@ class TopologyAnalysisError(ValueError):
 class TopologyAnalyzer:
     """
     Performs and caches topological analysis for a given circuit configuration.
-
-    This class uses a persistent, process-level cache to avoid redundant analysis
-    of immutable circuit topologies across multiple simulation runs. Its contract is to
-    operate exclusively on the provided simulation-ready `Circuit` object and its
-    associated `ParameterManager`, respecting the system's architectural boundaries.
+    (This class is not modified in Phase 9, Task 5)
     """
     _persistent_topology_cache: Dict[Tuple, Dict[str, Any]] = {}
 
@@ -285,14 +307,7 @@ class TopologyAnalyzer:
         logger.debug(f"TopologyAnalyzer initialized for circuit '{circuit.hierarchical_id}'.")
 
     def _get_cache_key(self) -> Tuple[str, Tuple[Tuple[str, str], ...]]:
-        """
-        Computes the definitive, hashable key for this circuit's topology.
-
-        This method operates ONLY on the synthesized `Circuit` object and its parameter
-        manager, respecting architectural boundaries. It correctly queries the
-        ParameterManager—the single source of truth—for the constant parameter
-        values that define the circuit's static topology.
-        """
+        """Computes the definitive, hashable key for this circuit's topology."""
         source_path_str = str(self.circuit.source_file_path)
         
         const_params = []
@@ -309,10 +324,7 @@ class TopologyAnalyzer:
         return (source_path_str, tuple(sorted(const_params)))
 
     def analyze(self) -> Dict[str, Any]:
-        """
-        Performs a full topological analysis, leveraging the persistent cache.
-        This is the primary, idempotent entry point for this class.
-        """
+        """Performs a full topological analysis, leveraging the persistent cache."""
         if self._analysis_results is not None:
             return self._analysis_results
 
@@ -373,9 +385,7 @@ class TopologyAnalyzer:
         return open_comp_ids
 
     def _build_ac_graph(self, structurally_open_components: Set[str]) -> nx.Graph:
-        """
-        Builds the AC connectivity graph for this circuit level, recursively analyzing subcircuits.
-        """
+        """Builds the AC connectivity graph for this circuit level, recursively analyzing subcircuits."""
         ac_graph = nx.Graph()
         ac_graph.add_nodes_from(self.circuit.nets.keys())
 
@@ -384,7 +394,6 @@ class TopologyAnalyzer:
                 continue
 
             if isinstance(sim_comp, SubcircuitInstance):
-                # Correct recursive call leverages the persistent cache.
                 sub_ta = TopologyAnalyzer(sim_comp.sub_circuit_object)
                 sub_results = sub_ta.analyze()
                 port_connectivity = sub_results["external_port_connectivity"]
@@ -395,7 +404,6 @@ class TopologyAnalyzer:
                     if net1 and net2 and net1 in ac_graph and net2 in ac_graph:
                         ac_graph.add_edge(net1, net2)
             elif isinstance(sim_comp, ComponentBase):
-                # This branch handles all leaf components.
                 raw_comp_data = sim_comp.raw_ir_data
                 if not isinstance(raw_comp_data, ParsedLeafComponentData): continue
 
