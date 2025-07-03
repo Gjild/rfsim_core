@@ -50,7 +50,7 @@ class BaseParsingError(DiagnosableError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass()
 class ParsingError(BaseParsingError):
     """
     Custom exception for logical errors or file-system issues during parsing.
@@ -75,7 +75,7 @@ class ParsingError(BaseParsingError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass()
 class SchemaValidationError(BaseParsingError):
     """
     Custom exception for failures during Cerberus schema validation.

@@ -26,7 +26,7 @@ from pathlib import Path
 from ..errors import DiagnosableError, format_diagnostic_report
 
 
-@dataclass(frozen=True)
+@dataclass()
 class MnaInputError(DiagnosableError):
     """
     Raised for logical or structural errors encountered during the setup of the
@@ -45,7 +45,7 @@ class MnaInputError(DiagnosableError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass()
 class ComponentError(DiagnosableError):
     """
 
@@ -69,7 +69,7 @@ class ComponentError(DiagnosableError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass()
 class SingularMatrixError(DiagnosableError, np.linalg.LinAlgError):
     """
     Raised when a matrix is found to be singular during LU factorization.
@@ -94,7 +94,7 @@ class SingularMatrixError(DiagnosableError, np.linalg.LinAlgError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass()
 class SingleLevelSimulationFailure(DiagnosableError):
     """
     An internal, context-enriching exception that wraps a low-level diagnosable

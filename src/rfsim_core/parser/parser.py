@@ -18,15 +18,22 @@ from .exceptions import ParsingError, SchemaValidationError
 
 logger = logging.getLogger(__name__)
 
+# --- CORRECTED REGEX DEFINITIONS ---
+
+# Define the core identifier pattern without anchors. This is the fragment used for composition.
+ID_REGEX_FRAGMENT = r"[a-zA-Z_][a-zA-Z0-9_]*"
+
 # This regex enforces the "Simplicity Through Constraint" architectural mandate.
-# It defines a valid identifier, explicitly forbidding '.' (FQN separator) and '-'
-# (mathematical operator) to prevent ambiguity and simplify the system.
-ID_REGEX = r"^[a-zA-Z_][a-zA-Z0-9_]*$"
+# It defines a valid identifier for a single token, explicitly forbidding '.' and '-'.
+# It is built from the fragment and anchored to ensure a full string match.
+ID_REGEX = f"^{ID_REGEX_FRAGMENT}$"
 ALLOWED_ID_CHARS = set(string.ascii_letters + string.digits + "_")
 
 # This more permissive regex allows dot-separated chains of valid identifiers.
 # It is used exclusively for the keys in a subcircuit's 'parameters' override block.
-PARAM_OVERRIDE_KEY_REGEX = f"^{ID_REGEX}(\\.{ID_REGEX})*$"
+# It is now correctly built from the un-anchored fragment.
+PARAM_OVERRIDE_KEY_REGEX = f"^{ID_REGEX_FRAGMENT}(\\.{ID_REGEX_FRAGMENT})*$"
+
 
 class EnhancedValidator(cerberus.Validator):
     """Custom Cerberus validator to enforce the project's strict naming conventions."""

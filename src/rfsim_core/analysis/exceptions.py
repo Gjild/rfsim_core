@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from ..errors import Diagnosable, format_diagnostic_report
 
 
-@dataclass(frozen=True)
+@dataclass()
 class DCAnalysisError(ValueError, Diagnosable):
     """Custom exception for errors during rigorous DC analysis."""
     hierarchical_context: str
@@ -21,7 +21,7 @@ class DCAnalysisError(ValueError, Diagnosable):
         )
 
 
-@dataclass(frozen=True)
+@dataclass()
 class TopologyAnalysisError(ValueError, Diagnosable):
     """Custom exception for errors during topological analysis."""
     hierarchical_context: str

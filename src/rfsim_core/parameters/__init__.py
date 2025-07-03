@@ -4,6 +4,7 @@ from .exceptions import (
     ParameterDefinitionError,
     ParameterScopeError,
     ParameterSyntaxError,
+    ParameterEvaluationError,
     CircularParameterDependencyError,
 )
 from .preprocessor import ExpressionPreprocessor
@@ -15,6 +16,7 @@ __all__ = [
     "ParameterDefinitionError",
     "ParameterScopeError",
     "ParameterSyntaxError",
+    "ParameterEvaluationError",
     "CircularParameterDependencyError",
     # Core Classes
     "ExpressionPreprocessor",

@@ -48,7 +48,7 @@ class ParameterError(DiagnosableError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass()
 class ParameterDefinitionError(ParameterError):
     """Raised for errors during the definition or parsing of a single parameter."""
     fqn: str
@@ -74,7 +74,7 @@ class ParameterDefinitionError(ParameterError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass()
 class ParameterScopeError(ParameterError):
     """Raised when a symbol in an expression cannot be resolved in its lexical scope."""
     owner_fqn: str
@@ -105,7 +105,7 @@ class ParameterScopeError(ParameterError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass()
 class ParameterSyntaxError(ParameterError):
     """Raised for invalid syntax in a parameter expression that prevents parsing."""
     owner_fqn: str
@@ -130,7 +130,7 @@ class ParameterSyntaxError(ParameterError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass()
 class CircularParameterDependencyError(ParameterError):
     """Raised when a circular dependency is detected among parameters."""
     cycle: List[str]
@@ -150,7 +150,7 @@ class CircularParameterDependencyError(ParameterError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass()
 class ParameterEvaluationError(ParameterError):
     """Raised when a runtime error occurs during the numerical evaluation of a valid expression."""
     fqn: str
