@@ -24,7 +24,7 @@ Key elements:
 """
 
 import logging
-from typing import Protocol, Type, Dict, Optional, List, Tuple, TypeVar, TYPE_CHECKING
+from typing import Protocol, Type, Dict, Optional, List, Tuple, TypeVar, TYPE_CHECKING, runtime_checkable
 import numpy as np
 
 # These imports are essential to define the method signatures correctly.
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@runtime_checkable
 class ComponentCapability(Protocol):
     """
     A marker protocol for all component capabilities. Any class that provides
@@ -54,7 +55,8 @@ class ComponentCapability(Protocol):
 TCapability = TypeVar("TCapability", bound=ComponentCapability)
 
 
-class IMnaContributor(ComponentCapability):
+@runtime_checkable
+class IMnaContributor(ComponentCapability, Protocol):
     """
     Defines the capability of a component to contribute to a linear,
     frequency-domain MNA system.
@@ -75,7 +77,8 @@ class IMnaContributor(ComponentCapability):
         ...
 
 
-class IDcContributor(ComponentCapability):
+@runtime_checkable
+class IDcContributor(ComponentCapability, Protocol):
     """
     Defines the capability of a component to contribute to a DC (F=0) analysis.
     The signature MUST match the data-passing requirements of the DCAnalyzer.

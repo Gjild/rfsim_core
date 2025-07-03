@@ -21,4 +21,20 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = ["src"]
+# Enable coverage reporting on every run, failing if coverage drops below the target.
+# This enforces a high quality standard and ensures error-handling paths are tested.
+#addopts = "--cov=src/rfsim_core --cov-report=term-missing --cov-report=html --cov-fail-under=95"
+
+[tool.coverage.run]
+# This is a non-negotiable configuration. Line coverage is insufficient; branch coverage
+# ensures that both sides of every `if/else` and other conditional logic are tested.
+# This is critical for verifying the robustness of error handling and the diagnostic
+# reporting paths within `except` blocks, which are often the most complex and
+# least-tested parts of a system.
+branch = true
+source = ["src/rfsim_core"]
+
+[tool.coverage.report]
+fail_under = 95
+show_missing = true

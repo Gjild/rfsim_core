@@ -60,7 +60,8 @@ from .capabilities import IMnaContributor, IDcContributor, provides
 # Use TYPE_CHECKING to import DCAnalysisResults only for type analysis,
 # preventing a circular import at runtime with analysis_tools.py.
 if TYPE_CHECKING:
-    from ..analysis_tools import DCAnalysisResults
+    # This import points to the new, formal result object in the 'analysis' package.
+    from ..analysis.results import DCAnalysisResults
 
 
 logger = logging.getLogger(__name__)
@@ -95,14 +96,30 @@ class SubcircuitInstance(ComponentBase):
             """
             Returns the N-port Y-matrix stamp from the pre-computed cache.
             """
-            assert (
-                component.cached_y_parameters_ac is not None
-            ), f"FATAL: Subcircuit '{component.fqn}' AC Y-parameters cache was not populated before stamping. This indicates a failure in the simulation executive."
+            # ROBUSTNESS ENHANCEMENT: Replaced assert with explicit check and diagnosable error.
+            if component.cached_y_parameters_ac is None:
+                raise ComponentError(
+                    component_fqn=component.fqn,
+                    details=(
+                        "FATAL: AC Y-parameters cache was not populated before stamping. "
+                        "This indicates a critical failure in the simulation executive."
+                    )
+                )
 
-            num_freqs, _, _ = component.cached_y_parameters_ac.shape
-            assert num_freqs == len(
-                freq_hz_array
-            ), f"Subcircuit '{component.fqn}' cache frequency count ({num_freqs}) mismatches sweep count ({len(freq_hz_array)})."
+            num_freqs_cache, _, _ = component.cached_y_parameters_ac.shape
+            num_freqs_sweep = len(freq_hz_array)
+
+            # NAMEERROR FIX & ROBUSTNESS ENHANCEMENT:
+            # Corrected `freq_array_hz` to `freq_hz_array` and replaced assert.
+            if num_freqs_cache != num_freqs_sweep:
+                raise ComponentError(
+                    component_fqn=component.fqn,
+                    details=(
+                        f"FATAL: Mismatched frequency count. Cache contains {num_freqs_cache} points, "
+                        f"but current sweep has {num_freqs_sweep} points. This indicates a critical "
+                        "failure in the simulation executive or caching logic."
+                    )
+                )
 
             admittance_matrix_qty = Quantity(
                 component.cached_y_parameters_ac, component.ureg.siemens
@@ -134,14 +151,17 @@ class SubcircuitInstance(ComponentBase):
             The returned DC Y-matrix MAY BE SINGULAR. It is the explicit responsibility
             of the consuming `DCAnalyzer` to handle this possibility robustly.
             """
-            assert (
-                component.cached_dc_analysis_results is not None
-            ), f"FATAL: Subcircuit '{component.fqn}' DC analysis results cache was not populated before its DC behavior was requested."
+            # ROBUSTNESS ENHANCEMENT: Replaced assert with explicit check and diagnosable error.
+            if component.cached_dc_analysis_results is None:
+                raise ComponentError(
+                    component_fqn=component.fqn,
+                    details=(
+                        "FATAL: DC analysis results cache was not populated before its DC behavior was requested. "
+                        "This indicates a critical failure in the simulation executive."
+                    )
+                )
 
-            # **ARCHITECTURAL CORRECTION:**
-            # The following line accesses the DC Y-matrix via a type-safe attribute on the
-            # `DCAnalysisResults` dataclass. This fulfills the "Explicit Contracts" mandate
-            # by replacing the previous brittle, "magic string"-based dictionary access.
+            # This uses the new, explicit dataclass contract.
             y_ports_dc_qty = component.cached_dc_analysis_results.y_ports_dc
 
             if isinstance(y_ports_dc_qty, Quantity) and y_ports_dc_qty.check(
@@ -181,6 +201,7 @@ class SubcircuitInstance(ComponentBase):
         ] = sub_circuit_external_port_names_ordered
 
         self.cached_y_parameters_ac: Optional[np.ndarray] = None
+        
         # This attribute now holds a dedicated dataclass, not a raw dictionary,
         # creating a robust, type-safe contract with the simulation executive.
         self.cached_dc_analysis_results: Optional["DCAnalysisResults"] = None
@@ -210,5 +231,6 @@ class SubcircuitInstance(ComponentBase):
     ) -> bool:
         """
         A subcircuit instance itself is never a simple structural open.
+        Its internal topology is handled by a recursive analysis.
         """
         return False

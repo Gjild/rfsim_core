@@ -2,7 +2,6 @@
 from .exceptions import (
     MnaInputError,
     ComponentError,
-    DCAnalysisError,
     SingularMatrixError,
     SingleLevelSimulationFailure,
 )
@@ -14,7 +13,6 @@ __all__ = [
     # Exceptions
     "MnaInputError",
     "ComponentError",
-    "DCAnalysisError",
     "SingularMatrixError",
     "SingleLevelSimulationFailure",
     # Core Classes

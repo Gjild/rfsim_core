@@ -14,29 +14,9 @@ from .raw_data import (
     ParsedLeafComponentData,
     ParsedSubcircuitData,
 )
+from .exceptions import ParsingError, SchemaValidationError
 
 logger = logging.getLogger(__name__)
-
-class SchemaValidationError(ValueError):
-    """
-    Custom exception raised when YAML does not conform to the schema.
-    Provides a rich, multi-line, deterministic error message for clear user feedback.
-    """
-    def __init__(self, errors: Dict, file_path: Path, *args):
-        self.errors = errors
-        error_lines = [
-            f"  - In field '{'.'.join(map(str, k))}': {v[0]}"
-            for k, v in sorted(errors.items())
-        ]
-        message = (
-            f"YAML schema validation failed for file '{file_path}':\n"
-            + "\n".join(error_lines)
-        )
-        super().__init__(message, *args)
-
-class ParsingError(ValueError):
-    """Custom exception for logical errors or file issues during parsing."""
-    pass
 
 # This regex enforces the "Simplicity Through Constraint" architectural mandate.
 # It defines a valid identifier, explicitly forbidding '.' (FQN separator) and '-'
@@ -73,6 +53,32 @@ class EnhancedValidator(cerberus.Validator):
                 f"dot-separated chain of valid identifiers (e.g., 'gain' or 'amp1.R_load.value').",
             )
 
+    def _validate_unique_elements_by_key(self, key_for_uniqueness: str, field: str, value: List[Dict]):
+        """
+        Validates that all dictionaries in a list have a unique value for a given key.
+        The rule's arguments are validated against this schema:
+        {'type': 'string'}
+        """
+        if not isinstance(value, list):
+            return # Let the 'type: list' rule handle this.
+
+        seen_keys = set()
+        duplicates = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue # Let sub-schema validation handle this.
+            
+            item_key = item.get(key_for_uniqueness)
+            if item_key is not None:
+                if item_key in seen_keys:
+                    duplicates.append(item_key)
+                else:
+                    seen_keys.add(item_key)
+        
+        if duplicates:
+            unique_duplicates = sorted(list(set(duplicates)))
+            self._error(field, f"Duplicate values found for key '{key_for_uniqueness}': {unique_duplicates}")
+
 class NetlistParser:
     """
     Recursively parses and validates a hierarchy of netlist YAML files.
@@ -91,7 +97,7 @@ class NetlistParser:
     }
 
     _standard_component_schema = {
-        "type": {"type": "string", "required": True, "id_regex": True, "disallowed": ["Subcircuit"]},
+        "type": {"type": "string", "required": True, "id_regex": True, "forbidden": ["Subcircuit"]},
         "id": _id_rule,
         "ports": {"type": "dict", "required": True, "minlength": 1, "keysrules": {"oneof": [{"type": "string", "id_regex": True}, {"type": "integer"}]}, "valuesrules": _net_name_rule},
         "parameters": {"type": "dict", "required": False, "keysrules": _param_key_rule, "valuesrules": _param_value_schema},
@@ -109,8 +115,8 @@ class NetlistParser:
         "circuit_name": {"type": "string", "required": False, "id_regex": True},
         "ground_net": {"type": "string", "required": False, "id_regex": True, "default": "gnd"},
         "parameters": {"type": "dict", "required": False, "keysrules": _param_key_rule, "valuesrules": _param_value_schema},
-        "components": {"type": "list", "required": True, "minlength": 1, "unique": "id", "schema": {"type": "dict", "oneof_schema": [_standard_component_schema, _subcircuit_component_schema]}},
-        "ports": {"type": "list", "required": False, "unique": "id", "schema": {"type": "dict", "schema": {"id": _id_rule, "reference_impedance": {"type": "string", "required": True}}}},
+        "components": {"type": "list", "required": True, "minlength": 1, "unique_elements_by_key": "id", "schema": {"type": "dict", "oneof_schema": [_standard_component_schema, _subcircuit_component_schema]}},
+        "ports": {"type": "list", "required": False, "unique_elements_by_key": "id", "schema": {"type": "dict", "schema": {"id": _id_rule, "reference_impedance": {"type": "string", "required": True}}}},
         "sweep": {
             "type": "dict", "required": False, "schema": {
                 "type": {"type": "string", "required": True, "allowed": ["linear", "log", "list"]},
@@ -137,7 +143,7 @@ class NetlistParser:
         """Internal recursive function that parses one file and returns its IR node."""
         resolved_path = yaml_path.resolve()
         if resolved_path in visited_paths:
-            raise ParsingError(f"Circular subcircuit dependency detected involving: {resolved_path}")
+            raise ParsingError(f"Circular subcircuit dependency detected involving: {resolved_path}", file_path=resolved_path)
         
         visited_paths.add(resolved_path)
         logger.debug(f"Parsing definition file: {resolved_path}")
@@ -189,16 +195,16 @@ class NetlistParser:
     def _load_yaml(self, source: Path) -> Dict[str, Any]:
         """Loads and performs basic sanity checks on a YAML file."""
         if not source.is_file():
-            raise FileNotFoundError(f"Netlist file not found: {source}")
+            raise ParsingError(details=f"Netlist file not found at path: {source}", file_path=source)
         try:
             with source.open("r", encoding="utf-8") as f:
                 content = yaml.safe_load(f)
             if content is None:
-                raise ParsingError(f"The YAML file '{source}' is empty or contains no valid content.")
+                raise ParsingError(details=f"The YAML file is empty or contains no valid content.", file_path=source)
             if not isinstance(content, dict):
-                raise ParsingError(f"The root of the YAML file '{source}' must be a dictionary (mapping).")
+                raise ParsingError(details=f"The root of the YAML file must be a dictionary (mapping).", file_path=source)
             return content
         except PermissionError as e:
-            raise ParsingError(f"Permission denied when trying to read '{source}': {e}") from e
+            raise ParsingError(details=f"Permission denied when trying to read file: {e}", file_path=source) from e
         except yaml.YAMLError as e:
-            raise ParsingError(f"Invalid YAML syntax in '{source}': {e}") from e
+            raise ParsingError(details=f"Invalid YAML syntax: {e}", file_path=source) from e

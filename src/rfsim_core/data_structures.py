@@ -1,11 +1,11 @@
 # src/rfsim_core/data_structures.py
+# Required for forward references in type hints (e.g., 'ComponentBase')
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, TYPE_CHECKING
 from pathlib import Path
-
-# Required for forward references in type hints (e.g., 'ComponentBase')
-from __future__ import annotations
 
 logger = logging.getLogger(__name__)
 

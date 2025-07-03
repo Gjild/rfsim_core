@@ -1,57 +1,82 @@
 # src/rfsim_core/simulation/exceptions.py
+"""
+Defines custom, diagnosable exceptions specific to the simulation execution phase.
+
+This module provides a hierarchy of exception classes that represent known, non-fatal
+failure modes that can occur *after* a circuit has been successfully built and is
+undergoing simulation (e.g., numerical issues, invalid component behavior at a specific
+frequency).
+
+**Architectural Revision:**
+In accordance with the project's definitive architecture, all exceptions in this module
+inherit from the `DiagnosableError` base class. This provides three key benefits:
+1.  **Catchability:** They are concrete classes that can be caught explicitly
+    in `try...except` blocks (e.g., `except MnaInputError:`).
+2.  **Contract Enforcement:** They are guaranteed by their base class to implement
+    the `get_diagnostic_report()` method, fulfilling the `Diagnosable` protocol.
+3.  **Hierarchy:** They are all catchable under the common `DiagnosableError` type,
+    allowing for clean, layered error handling.
+"""
 import numpy as np
 from typing import Optional, Any
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..errors import Diagnosable, format_diagnostic_report
+# Import the new, concrete base class and the report formatter.
+from ..errors import DiagnosableError, format_diagnostic_report
+
 
 @dataclass(frozen=True)
-class MnaInputError(ValueError, Diagnosable):
-    """Error related to inputs for MNA assembly."""
+class MnaInputError(DiagnosableError):
+    """
+    Raised for logical or structural errors encountered during the setup of the
+    MNA system, before any matrix assembly.
+    """
     hierarchical_context: str
     details: str
 
     def get_diagnostic_report(self) -> str:
+        """Generates the diagnostic report for an MNA input error."""
         return format_diagnostic_report(
             error_type="MNA Input Error",
             details=self.details,
-            suggestion="This is often an internal error or a circuit topology that violates MNA rules (e.g., floating ports).",
+            suggestion="This is often caused by a circuit topology that violates MNA rules, such as a floating port with no path to ground. Review the connectivity of the specified circuit context.",
             context={'fqn': self.hierarchical_context}
         )
 
+
 @dataclass(frozen=True)
-class ComponentError(ValueError, Diagnosable):
-    """Custom exception for component-related errors during simulation."""
+class ComponentError(DiagnosableError):
+    """
+
+    Raised when a specific component fails during its simulation calculations,
+    such as when provided with an invalid parameter value for a given frequency.
+    """
     component_fqn: str
     details: str
     frequency: Optional[float] = None
 
     def get_diagnostic_report(self) -> str:
+        """Generates the diagnostic report for a component simulation error."""
         return format_diagnostic_report(
             error_type="Component Simulation Error",
             details=self.details,
-            suggestion="Check the component's parameters and ensure they are valid for the given frequency.",
-            context={'fqn': self.component_fqn, 'frequency': f"{self.frequency:.4e} Hz" if self.frequency is not None else "N/A"}
+            suggestion="Check the component's parameters and ensure they are valid for the given frequency (e.g., non-negative resistance, real capacitance).",
+            context={
+                'fqn': self.component_fqn,
+                'frequency': f"{self.frequency:.4e} Hz" if self.frequency is not None else "N/A (DC or constant analysis)"
+            }
         )
 
-@dataclass(frozen=True)
-class DCAnalysisError(ValueError, Diagnosable):
-    """Custom exception for errors during rigorous DC analysis."""
-    hierarchical_context: str
-    details: str
-    
-    def get_diagnostic_report(self) -> str:
-        return format_diagnostic_report(
-            error_type="DC Analysis Error",
-            details=self.details,
-            suggestion="Review the circuit for issues with DC shorts (R=0, L=0) or opens (C=inf) that might create an invalid topology at F=0.",
-            context={'fqn': self.hierarchical_context}
-        )
 
 @dataclass(frozen=True)
-class SingularMatrixError(np.linalg.LinAlgError, Diagnosable):
-    """Custom exception for singular matrix during factorization or solve."""
+class SingularMatrixError(DiagnosableError, np.linalg.LinAlgError):
+    """
+    Raised when a matrix is found to be singular during LU factorization.
+
+    This class uses multiple inheritance to be catchable both as our custom
+    `DiagnosableError` and as a standard `LinAlgError`, providing flexibility.
+    """
     details: str
     frequency: Optional[float] = None
 
@@ -60,43 +85,47 @@ class SingularMatrixError(np.linalg.LinAlgError, Diagnosable):
         return f"Singular matrix detected{freq_str}: {self.details}"
 
     def get_diagnostic_report(self) -> str:
+        """Generates the diagnostic report for a singular matrix error."""
         return format_diagnostic_report(
             error_type="Singular Matrix Encountered",
             details=self.details,
-            suggestion="This is often caused by a floating sub-circuit or a shorted loop of ideal components at a specific frequency. Check your circuit topology and component values.",
-            context={'frequency': f"{self.frequency:.4e} Hz" if self.frequency else "N/A"}
+            suggestion="This is often caused by a floating sub-circuit, a loop of ideal voltage sources, or a loop of ideal inductors. Check your circuit topology and component values, especially for ideal (zero/infinite) cases at the specified frequency.",
+            context={'frequency': f"{self.frequency:.4e} Hz" if self.frequency is not None else "N/A"}
         )
 
+
 @dataclass(frozen=True)
-class SingleLevelSimulationFailure(Exception, Diagnosable):
+class SingleLevelSimulationFailure(DiagnosableError):
     """
     An internal, context-enriching exception that wraps a low-level diagnosable
     error with the high-level hierarchical context in which it occurred.
+
+    This is a key part of the "Actionable Diagnostics" mandate for hierarchical
+    designs. It allows the simulation engine to bubble up a failure from a deeply
+    nested subcircuit while adding the necessary context at each step.
     """
     circuit_fqn: str
     circuit_source_path: Path
-    original_error: Diagnosable
+    original_error: DiagnosableError
 
     def get_diagnostic_report(self) -> str:
-        # Get the report from the original, low-level error
-        original_report = self.original_error.get_diagnostic_report()
-        
-        # Prepend the hierarchical context to the report
-        header = [
-            f"Error occurred within circuit context: '{self.circuit_fqn}'",
-            f"Defined in file: '{self.circuit_source_path}'",
-        ]
-        
-        # We slice the original report to remove its header and combine it with our new, richer one.
-        original_lines = original_report.strip().splitlines()
-        report_body = "\n".join(original_lines[2:]) # Skip the "===", "Error Type:"
-        
-        # Re-assemble the full report with the new, richer header
-        full_report_lines = [
-            "\n",
-            "================ RFSim Core: Actionable Diagnostic Report ================",
-        ] + header + [report_body] + [
-            "========================================================================"
-        ]
-        
-        return "\n".join(full_report_lines)
+        """
+        Generates a composite report that prepends the hierarchical context
+        to the original root cause report.
+        """
+        # Get the full, formatted report from the original error.
+        root_cause_report = self.original_error.get_diagnostic_report()
+
+        # Create a new, enriched report that clearly shows the hierarchy.
+        enriched_report = format_diagnostic_report(
+            error_type="Simulation Failure in Hierarchical Context",
+            details=(
+                f"An error occurred while simulating the sub-circuit '{self.circuit_fqn}'.\n"
+                f"This sub-circuit is defined in: {self.circuit_source_path}\n\n"
+                f"--- Details of the Root Cause ---\n{root_cause_report}"
+            ),
+            suggestion="Address the root cause error detailed above. The error originates within the specified sub-circuit definition.",
+            # The primary context is the location of the failure.
+            context={'fqn': self.circuit_fqn, 'source_file': self.circuit_source_path}
+        )
+        return enriched_report

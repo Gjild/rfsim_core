@@ -7,7 +7,7 @@ from .exceptions import (
     CircularParameterDependencyError,
 )
 from .preprocessor import ExpressionPreprocessor
-from parameters import ParameterManager, ParameterDefinition
+from .parameters import ParameterManager, ParameterDefinition
 
 __all__ = [
     # Exceptions

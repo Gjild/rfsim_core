@@ -1,6 +1,7 @@
 # src/rfsim_core/errors.py
 import logging
-from typing import Any, Dict, Protocol
+from typing import Any, Dict, Protocol, abstractmethod
+from typing import runtime_checkable  # NEW: Import for runtime protocol checking
 
 logger = logging.getLogger(__name__)
 
@@ -26,16 +27,38 @@ class SimulationRunError(RFSimError):
     pass
 
 
-# --- Diagnostic Protocol (The Explicit Contract) ---
+# --- Diagnostic Protocol & Base Exception (The Explicit Contract) ---
 
+@runtime_checkable  # NEW: Makes this protocol compatible with isinstance() at runtime.
 class Diagnosable(Protocol):
     """
     A protocol for exceptions that can generate their own rich diagnostic report.
-    This decouples error handlers from the specific types of exceptions they process.
+    This remains for static type analysis, ensuring that any code can work with a
+    "diagnosable" object without needing to know its concrete type.
     """
     def get_diagnostic_report(self) -> str:
         """Generates a complete, user-friendly, multi-line report string."""
         ...
+
+class DiagnosableError(Exception, Diagnosable):
+    """
+    A common, concrete base class for all internal exceptions that are diagnosable.
+
+    This is the core of the architectural fix. It serves two purposes:
+    1. It inherits from `Exception`, making it a valid, concrete class for use in
+       `except` clauses.
+    2. It implements the `Diagnosable` protocol and declares `get_diagnostic_report`
+       as an abstract method. This uses the "Correctness by Construction" principle
+       to FORCE all subclasses to provide an implementation for generating a
+       user-friendly report, or they will fail at instantiation time.
+    """
+    @abstractmethod
+    def get_diagnostic_report(self) -> str:
+        """
+        Abstract method to generate the diagnostic report.
+        Subclasses MUST implement this.
+        """
+        raise NotImplementedError
 
 
 # --- Stateless Formatting Utility ---

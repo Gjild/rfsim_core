@@ -6,6 +6,8 @@ import numpy as np
 import scipy.sparse as sp
 from typing import Dict, List, Tuple, Optional, Set
 
+from .exceptions import MnaInputError
+
 from ..data_structures import Circuit, Net
 from ..parser.raw_data import ParsedLeafComponentData, ParsedSubcircuitData
 from ..components.base import ComponentBase, ComponentError, StampInfo
@@ -16,9 +18,9 @@ from ..parameters import ParameterManager, ParameterError
 logger = logging.getLogger(__name__)
 
 
-class MnaInputError(ValueError):
-    """Error related to inputs for MNA assembly."""
-    pass
+#class MnaInputError(ValueError):
+#    """Error related to inputs for MNA assembly."""
+#    pass
 
 
 class MnaAssembler:
