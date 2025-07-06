@@ -282,7 +282,7 @@ class ParameterManager:
 
     def _validate_and_build_dependency_graph(self) -> Set[str]:
         """
-        The definitive build-time validation and dependency analysis pipeline.
+        DEFINITIVE FIX: The definitive build-time validation and dependency analysis pipeline.
 
         This method iterates through ALL parameter definitions and performs rigorous checks:
         1.  Validates that the expression is syntactically correct Python.
