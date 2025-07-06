@@ -1,0 +1,16 @@
+circuit_name: HierarchicalConstantTest
+parameters:
+  # This parameter depends on a constant deep within a subcircuit.
+  # This MUST be evaluated at build-time.
+  derived_resistance: "sub1.R_load.resistance * 2"
+components:
+  - id: sub1
+    type: Subcircuit
+    definition_file: ./sub_for_dep_test.yaml
+    ports: { IN: net_in, OUT: net_out }
+  - id: R_final
+    type: Resistor
+    ports: { 0: net_out, 1: gnd }
+    parameters: { resistance: derived_resistance }
+ports:
+  - {id: net_in, reference_impedance: "50 ohm"}

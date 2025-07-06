@@ -1,0 +1,9 @@
+circuit_name: SubForDepTest
+components:
+  - id: R_load
+    type: Resistor
+    ports: { 0: IN, 1: OUT }
+    parameters: { resistance: "100 ohm", } # A simple constant value
+ports:
+  - {id: IN, reference_impedance: "50 ohm"}
+  - {id: OUT, reference_impedance: "50 ohm"}

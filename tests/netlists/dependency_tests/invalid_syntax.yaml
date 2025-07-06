@@ -1,0 +1,8 @@
+circuit_name: InvalidSyntaxTest
+parameters:
+  bad_param: "5 + * 3"
+components:
+  - id: R1
+    type: Resistor
+    ports: { 0: in, 1: gnd }
+    parameters: { resistance: "10 ohm" }

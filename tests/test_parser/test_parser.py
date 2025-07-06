@@ -20,11 +20,10 @@ from rfsim_core.errors import CircuitBuildError
 def create_netlist_files(tmp_path: Path) -> Path:
     """
     Creates a standard set of YAML files in a temporary directory for testing.
-    This follows the structure laid out in the "Definitive Test Architecture".
+    REVISED to use the mandatory `Quantity()` constructor for all dimensioned values
+    and to fix the expression in `python_keyword_id.yaml`.
     """
     netlists_path = tmp_path / "netlists"
-
-    # --- Valid Netlists ---
     valid_path = netlists_path / "valid"
     valid_path.mkdir(parents=True, exist_ok=True)
     (valid_path / "simple_rlc.yaml").write_text("""
@@ -34,16 +33,15 @@ components:
   - id: R1
     type: Resistor
     ports: {0: net_in, 1: net_out}
-    parameters: {resistance: '50 ohm'}
+    parameters: {resistance: "Quantity('50 ohm')"}
   - id: L1
     type: Inductor
     ports: {0: net_out, 1: gnd}
-    parameters: {inductance: '10 nH'}
+    parameters: {inductance: "Quantity('10 nH')"}
 ports:
-  - {id: net_in, reference_impedance: '50 ohm'}
-  - {id: net_out, reference_impedance: '50 ohm'}
-    """)
-
+  - {id: net_in, reference_impedance: "Quantity('50 ohm')"}
+  - {id: net_out, reference_impedance: "Quantity('50 ohm')"}
+""")
     (valid_path / "hierarchical_attenuator.yaml").write_text("""
 circuit_name: HierarchicalAttenuator
 ground_net: gnd
@@ -51,29 +49,24 @@ components:
   - id: X1
     type: Subcircuit
     definition_file: ./attenuator_section.yaml
-    ports:
-      IN: net_in
-      OUT: net_mid
+    ports: {IN: net_in, OUT: net_mid}
     parameters:
-      R1_val: '100 ohm'
-      R2_val: '50 ohm'
+      R1_val: "Quantity('100 ohm')"
+      R2_val: "Quantity('50 ohm')"
   - id: X2
     type: Subcircuit
     definition_file: ./attenuator_section.yaml
-    ports:
-      IN: net_mid
-      OUT: net_out
+    ports: {IN: net_mid, OUT: net_out}
 ports:
-  - {id: net_in, reference_impedance: '50 ohm'}
-  - {id: net_out, reference_impedance: '50 ohm'}
-    """)
-
+  - {id: net_in, reference_impedance: "Quantity('50 ohm')"}
+  - {id: net_out, reference_impedance: "Quantity('50 ohm')"}
+""")
     (valid_path / "attenuator_section.yaml").write_text("""
 circuit_name: AttenuatorSection
 ground_net: gnd
 parameters:
-  R1_val: '100 ohm'
-  R2_val: '50 ohm'
+  R1_val: {expression: "Quantity('100 ohm')", dimension: "ohm"}
+  R2_val: {expression: "Quantity('50 ohm')", dimension: "ohm"}
 components:
   - id: R1
     type: Resistor
@@ -84,53 +77,48 @@ components:
     ports: {0: OUT, 1: gnd}
     parameters: {resistance: R2_val}
 ports:
-  - {id: IN, reference_impedance: '50 ohm'}
-  - {id: OUT, reference_impedance: '50 ohm'}
-    """)
-
+  - {id: IN, reference_impedance: "Quantity('50 ohm')"}
+  - {id: OUT, reference_impedance: "Quantity('50 ohm')"}
+""")
     (valid_path / "no_gnd_key.yaml").write_text("""
 circuit_name: NoGndKey
 components:
   - id: R1
     type: Resistor
     ports: {0: in, 1: gnd}
-    parameters: {resistance: '50 ohm'}
-    """)
+    parameters: {resistance: "Quantity('50 ohm')"}
+""")
 
-    # --- Invalid Schema Netlists ---
     invalid_schema_path = netlists_path / "invalid_schema"
     invalid_schema_path.mkdir(parents=True, exist_ok=True)
     (invalid_schema_path / "invalid_identifier.yaml").write_text("""
-circuit_name: InvalidID-circuit # Invalid due to '-'
+circuit_name: InvalidID-circuit
 components:
-  - id: R-1 # Invalid ID due to '-'
+  - id: R-1
     type: Resistor
-    ports:
-      0: net.in # Invalid net name due to '.'
-      1: gnd
-    parameters:
-      resistance: '50 ohm'
-    """)
+    ports: {0: net.in, 1: gnd}
+    parameters: {resistance: "Quantity('50 ohm')"}
+""")
     (invalid_schema_path / "duplicate_component_id.yaml").write_text("""
 circuit_name: DupeID
 components:
   - id: R1
     type: Resistor
     ports: {0: in, 1: mid}
-    parameters: {resistance: '50 ohm'}
-  - id: R1 # Duplicate ID
+    parameters: {resistance: "Quantity('50 ohm')"}
+  - id: R1
     type: Resistor
     ports: {0: mid, 1: gnd}
-    parameters: {resistance: '100 ohm'}
-    """)
+    parameters: {resistance: "Quantity('100 ohm')"}
+""")
     (invalid_schema_path / "malformed.yaml").write_text("""
 circuit_name: Malformed
 components:
 - id: R1
   type: Resistor
-   ports: {0: in, 1: out} # Bad indentation
-  parameters: {resistance: '50 ohm'}
-    """)
+   ports: {0: in, 1: out}
+  parameters: {resistance: "Quantity('50 ohm')"}
+""")
     (invalid_schema_path / "circular_top.yaml").write_text("""
 circuit_name: CircularTop
 components:
@@ -138,7 +126,7 @@ components:
     type: Subcircuit
     definition_file: ./circular_sub.yaml
     ports: {IN: net_in, OUT: net_out}
-    """)
+""")
     (invalid_schema_path / "circular_sub.yaml").write_text("""
 circuit_name: CircularSub
 components:
@@ -146,24 +134,26 @@ components:
     type: Subcircuit
     definition_file: ./circular_top.yaml
     ports: {IN: IN, OUT: OUT}
-    """)
+""")
+    # --- DEFINITIVE FIX FOR THIS FILE ---
+    # The `my_param` value is now a true expression, not a string literal.
+    # The outer single quotes have been removed.
     (invalid_schema_path / "python_keyword_id.yaml").write_text("""
 circuit_name: KeywordID
 parameters:
-  my_param: 'for * 2' # This expression will cause a syntax error
+  my_param: "for * 2"
 components:
   - id: R1
     type: Resistor
     ports: {0: in, 1: out}
-    parameters: {resistance: '50 ohm'}
-  - id: for # Using a Python keyword as an ID. Parsing is ok, build should fail.
+    parameters: {resistance: "Quantity('50 ohm')"}
+  - id: for
     type: Resistor
     ports: {0: out, 1: gnd}
-    parameters: {resistance: '100 ohm'}
+    parameters: {resistance: "Quantity('100 ohm')"}
 ports:
-  - {id: in, reference_impedance: '50 ohm'}
-    """)
-
+  - {id: in, reference_impedance: "Quantity('50 ohm')"}
+""")
     return netlists_path
 
 
@@ -199,7 +189,7 @@ class TestNetlistParser:
         assert r1_ir.instance_id == "R1"
         assert r1_ir.component_type == "Resistor"
         assert r1_ir.raw_ports_dict == {0: "net_in", 1: "net_out"}
-        assert r1_ir.raw_parameters_dict == {"resistance": "50 ohm"}
+        assert r1_ir.raw_parameters_dict == {'resistance': "Quantity('50 ohm')"}
 
         l1_ir = ir_root.components[1]
         assert isinstance(l1_ir, ParsedLeafComponentData)
@@ -225,7 +215,7 @@ class TestNetlistParser:
         assert x1_ir.instance_id == "X1"
         assert x1_ir.component_type == "Subcircuit"
         assert x1_ir.raw_port_mapping == {"IN": "net_in", "OUT": "net_mid"}
-        assert x1_ir.raw_parameter_overrides == {"R1_val": "100 ohm", "R2_val": "50 ohm"}
+        assert x1_ir.raw_parameter_overrides == {'R1_val': "Quantity('100 ohm')", 'R2_val': "Quantity('50 ohm')"}
 
         # Check the nested IR node
         sub_ir = x1_ir.sub_circuit_definition_node
@@ -233,7 +223,7 @@ class TestNetlistParser:
         assert sub_ir.circuit_name == "AttenuatorSection"
         assert len(sub_ir.components) == 2
         assert len(sub_ir.raw_parameters_dict) == 2
-        assert sub_ir.raw_parameters_dict['R1_val'] == '100 ohm'
+        assert sub_ir.raw_parameters_dict['R1_val'] == {'dimension': 'ohm', 'expression': "Quantity('100 ohm')"}
 
     def test_default_ground_net_is_applied(self, netlists_dir):
         """Verifies the default ground net name is used when the key is omitted."""
@@ -270,7 +260,6 @@ class TestNetlistParser:
 
         report = excinfo.value.get_diagnostic_report()
         assert "Schema Validation Error" in report
-        # Use the correct STRING key to access the error message
         assert "Duplicate values found for key 'id'" in excinfo.value.errors['components'][0]
         assert "duplicate values" in report.lower()
 
@@ -323,17 +312,20 @@ class TestNetlistParser:
         assert parsed_tree is not None
         assert any(comp.instance_id == 'for' for comp in parsed_tree.components)
 
-        # The build process should fail when the ExpressionPreprocessor encounters
-        # the keyword 'for' in an expression.
+        # The build process should fail because the expression "for * 2" uses the identifier 'for'
+        # which is not a defined parameter in its scope.
         with pytest.raises(CircuitBuildError) as excinfo:
             builder.build_simulation_model(parsed_tree)
 
         # Assert on the final, user-facing diagnostic report.
         report = str(excinfo.value)
         assert "Actionable Diagnostic Report" in report
+            
+        # Correct the assertions to match the actual, correct behavior of the program.
+        # The error is an "Invalid Expression Syntax" error, not an "Unresolved Symbol" error,
+        # because `ast.parse` fails before symbol resolution can even be attempted.
         assert "Error Type:     Invalid Expression Syntax" in report
         assert "FQN:            top.my_param" in report
         assert "User Input:     'for * 2'" in report
-        # The details should indicate a syntax error because 'for' is an invalid
-        # token in the SymPy/Python expression parsing context.
-        assert "invalid syntax" in report.lower() or "invalid token" in report.lower()
+        # The details should indicate that the syntax is invalid.
+        assert "invalid syntax" in report.lower()

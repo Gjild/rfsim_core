@@ -4,38 +4,18 @@
 Manages all circuit parameters, their dependencies, and their evaluation with
 rigorous, dimensionally-aware arithmetic.
 
-**Architectural Overview (Post-Phase 10 Refactoring):**
-
-This module represents the definitive architecture for parameter handling in RFSim Core.
-Its design has been refactored to a single, unified pipeline that is intrinsically
-unit-safe and predictable. It is governed by the following non-negotiable principles:
-
-1.  **A Single, Consistent Language:** All parameter expressions are interpreted as
-    standard Python code. Any literal with units MUST be explicitly constructed
-    using the provided `Quantity` function (e.g., "Quantity('10 nH')"). This
-    eliminates all syntactic ambiguity of the previous "Two-Language" architecture.
-
-2.  **Intrinsic Safety via `eval()`:** The core of the system is Python's `eval()`
-    function, operating within a carefully constructed, unit-aware scope populated
-    with `pint.Quantity` objects. This delegates all dimensional analysis and
-    arithmetic to the `pint` library itself, making silently incorrect,
-    dimensionally-incompatible calculations impossible by construction.
-
-3.  **Build-Time Validation via Graph-Based Dependency Resolution:**
-    The `ParameterManager.build()` process now uses a correct and robust two-stage
-    approach for constant parameters:
-    a) First, it builds a dependency graph of all constant-valued parameters by
-       statically analyzing their expression strings.
-    b) Second, it topologically sorts this graph to get a guaranteed-correct
-       evaluation order, then evaluates each constant in sequence.
-    This provides immediate, build-time validation for a large class of user inputs
-    and pre-computes results for a significant performance gain, while correctly
-    handling all valid dependency chains.
+**Architectural Revision (Post-Phase 10):**
+This module has been significantly hardened to enforce the "Correctness by Construction"
+and "Actionable Diagnostics" mandates. The `ParameterManager.build()` method now
+executes a rigorous, multi-stage validation pipeline that ensures all parameter
+expressions are syntactically and semantically valid *before* any numerical
+evaluation is attempted. This catches errors at the earliest possible stage and
+provides superior diagnostic reports.
 """
 
 import logging
-import re
-from typing import Dict, Any, Set, Optional, List, Callable, Tuple, ChainMap
+import ast
+from typing import Dict, Any, Set, List, Tuple, ChainMap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,6 +24,7 @@ import networkx as nx
 import numpy as np
 
 from ..units import ureg, Quantity
+from .dependency_parser import ASTDependencyExtractor
 from .exceptions import (
     ParameterError,
     ParameterDefinitionError,
@@ -64,7 +45,6 @@ class ParameterDefinition:
     raw_value_or_expression_str: str
     source_yaml_path: Path
     declared_dimension_str: str
-    is_sweepable: bool = False
 
     @property
     def fqn(self) -> str:
@@ -72,22 +52,112 @@ class ParameterDefinition:
         return f"{self.owner_fqn}.{self.base_name}"
 
 
-class ParameterManager:
+class _ExpressionEvaluator:
     """
-    Manages all circuit parameters, their dependencies, and their evaluation with
-    rigorous, dimensionally-aware arithmetic.
+    A private helper service that robustly evaluates a parameter expression string
+    by first transforming its AST to use safe placeholder variables.
     """
-    GLOBAL_SCOPE_PREFIX = "_rfsim_global_"
-    RESERVED_KEYWORDS = {'freq'}
-
     _EVAL_GLOBALS = {
         "ureg": ureg,
         "Quantity": Quantity,
         "np": np,
         "pi": np.pi,
+        #"__builtins__": {"abs": abs, "min": min, "max": max} # A minimal, safe set
     }
 
-    _IDENTIFIER_REGEX = re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b')
+    class _AstTransformer(ast.NodeTransformer):
+        """
+        Transforms an expression's AST by replacing dependencies with safe
+        placeholder variables and building the corresponding evaluation scope.
+        """
+        def __init__(self, scope: ChainMap, evaluated_dependencies: Dict[str, Quantity]):
+            self.scope = scope
+            self.evaluated_dependencies = evaluated_dependencies
+            self.eval_locals: Dict[str, Quantity] = {}
+            self._placeholder_counter = 0
+
+        def _get_placeholder(self) -> str:
+            name = f"_rfsim_var_{self._placeholder_counter}"
+            self._placeholder_counter += 1
+            return name
+
+        def _reconstruct_attribute_chain(self, node: ast.Attribute) -> str:
+            """Same robust reconstruction logic as the dependency extractor."""
+            parts = []
+            curr = node
+            while isinstance(curr, ast.Attribute):
+                parts.append(curr.attr)
+                curr = curr.value
+            if isinstance(curr, ast.Name):
+                parts.append(curr.id)
+                return ".".join(reversed(parts))
+            return ""
+
+        def visit_Name(self, node: ast.Name) -> ast.Name:
+            """
+            Handles both special runtime values (like 'freq') and lexically-scoped
+            parameter identifiers (like 'gain').
+            """
+            identifier_str = node.id
+
+            if identifier_str == 'freq' and 'freq' in self.evaluated_dependencies:
+                placeholder = self._get_placeholder()
+                self.eval_locals[placeholder] = self.evaluated_dependencies['freq']
+                return ast.Name(id=placeholder, ctx=ast.Load())
+
+            if identifier_str in self.scope:
+                resolved_fqn = self.scope[identifier_str]
+                if resolved_fqn in self.evaluated_dependencies:
+                    placeholder = self._get_placeholder()
+                    self.eval_locals[placeholder] = self.evaluated_dependencies[resolved_fqn]
+                    return ast.Name(id=placeholder, ctx=ast.Load())
+
+            return node
+
+        def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+            """Handles hierarchical identifiers like 'sub1.R_load.resistance'."""
+            full_chain = self._reconstruct_attribute_chain(node)
+            if full_chain and full_chain in self.scope:
+                resolved_fqn = self.scope[full_chain]
+                if resolved_fqn in self.evaluated_dependencies:
+                    placeholder = self._get_placeholder()
+                    self.eval_locals[placeholder] = self.evaluated_dependencies[resolved_fqn]
+                    return ast.Name(id=placeholder, ctx=ast.Load())
+
+            return self.generic_visit(node)
+
+    def evaluate(
+        self,
+        definition: ParameterDefinition,
+        scope: ChainMap,
+        evaluated_dependencies: Dict[str, Quantity]
+    ) -> Quantity:
+        """
+        Transforms and evaluates a parameter expression.
+        """
+        try:
+            tree = ast.parse(definition.raw_value_or_expression_str, mode='eval')
+        except SyntaxError as e:
+            raise ParameterSyntaxError(
+                owner_fqn=definition.fqn,
+                user_input=definition.raw_value_or_expression_str,
+                source_yaml_path=definition.source_yaml_path,
+                details=f"Invalid Python syntax: {e}"
+            ) from e
+
+        transformer = self._AstTransformer(scope, evaluated_dependencies)
+        transformed_tree = transformer.visit(tree)
+        safe_expr_str = ast.unparse(transformed_tree)
+        eval_locals = transformer.eval_locals
+
+        return eval(safe_expr_str, self._EVAL_GLOBALS, eval_locals)
+
+
+class ParameterManager:
+    """
+    Manages all circuit parameters, their dependencies, and their evaluation.
+    """
+    RESERVED_KEYWORDS = {'freq'}
 
     def __init__(self):
         self._ureg = ureg
@@ -97,6 +167,8 @@ class ParameterManager:
         self._parsed_constants: Dict[str, Quantity] = {}
         self._evaluation_order: List[str] = []
         self._scope_maps: Dict[str, ChainMap] = {}
+        self._dependency_extractor = ASTDependencyExtractor()
+        self._evaluator = _ExpressionEvaluator()
         logger.info("ParameterManager initialized (empty).")
 
     def build(self, all_definitions: List[ParameterDefinition], scope_maps: Dict[str, ChainMap]):
@@ -109,22 +181,29 @@ class ParameterManager:
 
         self._scope_maps = scope_maps
         try:
+            # Step 1: Create the basic context map from definitions.
             self._create_context_map_from_definitions(all_definitions)
-            constant_candidates = {
-                fqn for fqn, ctx in self._parameter_context_map.items()
-                if "freq" not in ctx['definition'].raw_value_or_expression_str
-            }
-            self._build_constant_dependency_graph(constant_candidates)
+
+            # Step 2: Call the new, robust validation and graph-building method.
+            # This performs all necessary build-time checks for syntax and semantics.
+            self._validate_and_build_dependency_graph()
+
+            # Step 3: Check for cycles in the now-validated graph of constants.
             self._check_circular_dependencies()
+
+            # Step 4: Evaluate constants using the validated graph.
             self._evaluate_and_cache_constants()
+
+            # Step 5 & 6 (No change): Compute final metadata.
             self._compute_and_cache_constant_flags()
             self._compute_evaluation_order()
+
         except ParameterError as e:
             self._clear_build_state()
             raise
         except Exception as e:
             self._clear_build_state()
-            raise ParameterError(f"Unexpected error during build: {e}") from e
+            raise ParameterError(f"Unexpected error during ParameterManager build: {e}") from e
 
         self._build_complete = True
         logger.info(f"ParameterManager build complete. Defined parameters: {len(self._parameter_context_map)}.")
@@ -141,26 +220,18 @@ class ParameterManager:
                 results[fqn] = const_qty
 
         dynamic_fqns = [fqn for fqn in self._evaluation_order if fqn not in self._parsed_constants]
-
         base_eval_scope = results.copy()
         base_eval_scope['freq'] = Quantity(freq_hz, self._ureg.hertz)
-        base_eval_scope.update(self._EVAL_GLOBALS)
 
         for fqn in dynamic_fqns:
             if fqn == 'freq': continue
-            
+
             definition = self._parameter_context_map[fqn]['definition']
-            
-            param_lexical_scope = self._scope_maps.get(fqn)
-            eval_locals = base_eval_scope.copy()
-            if param_lexical_scope:
-                for base_name, resolved_fqn in param_lexical_scope.items():
-                    if resolved_fqn in base_eval_scope:
-                        eval_locals[base_name] = base_eval_scope[resolved_fqn]
-            
+            lexical_scope = self._scope_maps.get(fqn, ChainMap())
+
             try:
-                result_val = eval(definition.raw_value_or_expression_str, self._EVAL_GLOBALS, eval_locals)
-                
+                result_val = self._evaluator.evaluate(definition, lexical_scope, base_eval_scope)
+
                 if not isinstance(result_val, Quantity):
                     result_val = Quantity(result_val, definition.declared_dimension_str)
                 if not isinstance(result_val.magnitude, np.ndarray):
@@ -173,35 +244,24 @@ class ParameterManager:
                     error_indices = np.argwhere(numerical_errors_mask).flatten()
                     fail_val = result_val.magnitude[error_indices[0]]
                     details = f"Expression resulted in a non-finite value ({fail_val})."
-                    raise ParameterEvaluationError(fqn=fqn, details=details, error_indices=error_indices, frequencies=freq_hz, input_values=eval_locals)
+                    raise ParameterEvaluationError(fqn=fqn, details=details, error_indices=error_indices, frequencies=freq_hz, input_values=base_eval_scope)
 
-                # --- START OF CORRECTED DIMENSIONALITY LOGIC (DYNAMIC EVAL) ---
                 if definition.declared_dimension_str == "dimensionless":
                     if not result_val.dimensionless:
-                        raise pint.DimensionalityError(
-                            result_val.units, "dimensionless",
-                            extra_msg=f" for parameter '{fqn}' which was declared dimensionless."
-                        )
+                        raise pint.DimensionalityError(result_val.units, "dimensionless", extra_msg=f" for parameter '{fqn}'")
                     final_qty = result_val
                 else:
-                    # Parameter was declared with a dimension.
                     expected_unit = self._ureg.Unit(definition.declared_dimension_str)
                     if not result_val.is_compatible_with(expected_unit):
-                        raise pint.DimensionalityError(
-                            result_val.units, expected_unit,
-                            extra_msg=f" for expression '{definition.raw_value_or_expression_str}'"
-                        )
-                    # Always convert to the declared dimension for consistency.
+                        raise pint.DimensionalityError(result_val.units, expected_unit, extra_msg=f" for expression '{definition.raw_value_or_expression_str}'")
                     final_qty = result_val.to(expected_unit)
-                # --- END OF CORRECTED DIMENSIONALITY LOGIC ---
-                
+
                 results[fqn] = final_qty
                 base_eval_scope[fqn] = final_qty
 
             except Exception as e:
-                if isinstance(e, ParameterEvaluationError): raise
-                if isinstance(e, ParameterError): raise
-                raise ParameterEvaluationError(fqn=fqn, details=str(e), error_indices=None, frequencies=freq_hz, input_values=eval_locals) from e
+                if isinstance(e, (ParameterEvaluationError, ParameterError)): raise
+                raise ParameterEvaluationError(fqn=fqn, details=str(e), error_indices=None, frequencies=freq_hz, input_values=base_eval_scope) from e
 
         return results
 
@@ -218,26 +278,79 @@ class ParameterManager:
             fqn = definition.fqn
             if fqn in self._parameter_context_map:
                 raise ParameterDefinitionError(fqn=fqn, user_input=definition.raw_value_or_expression_str, source_yaml_path=definition.source_yaml_path, details=f"Duplicate parameter FQN '{fqn}' detected.")
-            self._parameter_context_map[fqn] = {'definition': definition, 'dependencies': set()}
+            self._parameter_context_map[fqn] = {'definition': definition}
 
-    def _build_constant_dependency_graph(self, constant_candidates: Set[str]):
-        logger.debug("Building dependency graph for %d constant candidates...", len(constant_candidates))
-        self._dependency_graph.add_nodes_from(constant_candidates)
+    def _validate_and_build_dependency_graph(self) -> Set[str]:
+        """
+        The definitive build-time validation and dependency analysis pipeline.
 
-        for fqn in constant_candidates:
-            definition = self._parameter_context_map[fqn]['definition']
+        This method iterates through ALL parameter definitions and performs rigorous checks:
+        1.  Validates that the expression is syntactically correct Python.
+        2.  Extracts all dependencies from the expression's AST.
+        3.  For each dependency, verifies that it is either a known global, the special 'freq'
+            keyword, or a symbol that can be resolved to another parameter's FQN.
+        4.  Builds the dependency graph for all non-dynamic parameters.
+        5.  Raises a specific, diagnosable error for any validation failure.
+        """
+        logger.debug("Starting comprehensive validation and dependency graph build...")
+        self._dependency_graph = nx.DiGraph()
+        self._dependency_graph.add_nodes_from(self._parameter_context_map.keys())
+        dynamic_params: Set[str] = set()
+        known_globals = set(self._evaluator._EVAL_GLOBALS.keys())
+
+        for fqn, context in self._parameter_context_map.items():
+            definition = context['definition']
             expression = definition.raw_value_or_expression_str
-            scope = self._scope_maps.get(fqn)
-            if not scope: continue
+            scope = self._scope_maps.get(fqn, ChainMap())
 
-            potential_deps = self._IDENTIFIER_REGEX.findall(expression)
-            for dep_base_name in potential_deps:
-                if dep_base_name in self._EVAL_GLOBALS or dep_base_name in self.RESERVED_KEYWORDS:
+            try:
+                dependencies = self._dependency_extractor.get_dependencies(expression)
+            except SyntaxError as e:
+                raise ParameterSyntaxError(
+                    owner_fqn=fqn,
+                    user_input=expression,
+                    source_yaml_path=definition.source_yaml_path,
+                    details=f"Invalid Python syntax: {e}"
+                ) from e
+
+            is_dynamic = False
+            for dep_name in dependencies:
+                # A dependency is valid if:
+                # 1. Its base (the part before the first '.') is a known global (e.g., 'np' in 'np.log').
+                # 2. It is an exact match for a known global (e.g., 'pi').
+                # 3. It is the special 'freq' keyword.
+                # 4. It is resolvable in the current lexical scope.
+                is_known_global_or_child = (dep_name in known_globals or dep_name.split('.')[0] in known_globals)
+
+                if is_known_global_or_child:
                     continue
-                if dep_base_name in scope:
-                    resolved_dep_fqn = scope[dep_base_name]
-                    if resolved_dep_fqn in constant_candidates:
-                        self._dependency_graph.add_edge(resolved_dep_fqn, fqn)
+
+                if dep_name == 'freq':
+                    is_dynamic = True
+                    continue
+
+                if dep_name not in scope:
+                    raise ParameterScopeError(
+                        owner_fqn=fqn,
+                        unresolved_symbol=dep_name,
+                        user_input=expression,
+                        source_yaml_path=definition.source_yaml_path,
+                        resolution_path_details=(
+                            f"The symbol '{dep_name}' is not a known parameter in the current scope, "
+                            "a recognized global (like 'np', 'pi'), or the 'freq' keyword."
+                        )
+                    )
+
+                resolved_dep_fqn = scope[dep_name]
+                self._dependency_graph.add_edge(resolved_dep_fqn, fqn)
+
+            if is_dynamic:
+                dynamic_params.add(fqn)
+
+        # Prune dynamic parameters from the graph. The graph will now only contain
+        # connections between parameters that are candidates for constant evaluation.
+        self._dependency_graph.remove_nodes_from(dynamic_params)
+        logger.debug(f"Validation and graph build complete. Found {len(dynamic_params)} dynamic parameters.")
 
     def _check_circular_dependencies(self):
         try:
@@ -249,73 +362,48 @@ class ParameterManager:
 
     def _evaluate_and_cache_constants(self):
         try:
+            # The graph now only contains constant parameters, so this sort is correct.
             constant_evaluation_order = list(nx.topological_sort(self._dependency_graph))
         except nx.NetworkXUnfeasible:
+            # This path is still a valid check for cycles among constants.
             raise CircularParameterDependencyError(cycle=[])
 
         logger.debug("Eagerly evaluating %d constants in dependency order...", len(constant_evaluation_order))
         self._parsed_constants = {}
-        base_eval_scope = self._EVAL_GLOBALS.copy()
 
         for fqn in constant_evaluation_order:
             definition = self._parameter_context_map[fqn]['definition']
-            
-            param_lexical_scope = self._scope_maps.get(fqn)
-            eval_locals = base_eval_scope.copy()
-            if param_lexical_scope:
-                for base_name, resolved_fqn in param_lexical_scope.items():
-                    if resolved_fqn in self._parsed_constants:
-                        eval_locals[base_name] = self._parsed_constants[resolved_fqn]
+            lexical_scope = self._scope_maps.get(fqn, ChainMap())
 
             try:
-                result_val = eval(definition.raw_value_or_expression_str, self._EVAL_GLOBALS, eval_locals)
+                result_val = self._evaluator.evaluate(definition, lexical_scope, self._parsed_constants)
 
                 if not isinstance(result_val, Quantity):
                     result_val = Quantity(result_val, definition.declared_dimension_str)
 
-                # --- START OF FIX #2: NON-NEGOTIABLE CHECK FOR NON-FINITE CONSTANTS ---
                 mag = result_val.magnitude
-                # This check is robust for scalars (float, int, np.number) and numpy arrays.
                 if isinstance(mag, (float, int, np.number, np.ndarray)):
-                    # Suppress "invalid value encountered in isfinite" warnings from the check itself
                     with np.errstate(invalid='ignore'):
                         if not np.all(np.isfinite(mag)):
-                            # Find the first non-finite value for a clear error message.
-                            fail_val = mag
-                            if isinstance(mag, np.ndarray):
-                                non_finite_mask = ~np.isfinite(mag)
-                                fail_val = mag[non_finite_mask][0] if np.any(non_finite_mask) else mag
-                            
+                            fail_val = mag[~np.isfinite(mag)][0] if isinstance(mag, np.ndarray) and np.any(~np.isfinite(mag)) else mag
                             details = f"Constant expression resulted in a non-finite value ({fail_val})."
-                            # This is an unrecoverable build error.
                             raise ValueError(details)
-                # --- END OF FIX #2 ---
 
-                # --- START OF FIX #1: CORRECT DIMENSIONALITY LOGIC (CONSTANT EVAL) ---
                 if definition.declared_dimension_str == "dimensionless":
                     if not result_val.dimensionless:
-                        raise pint.DimensionalityError(
-                            result_val.units, "dimensionless",
-                            extra_msg=f" for parameter '{fqn}' which was declared dimensionless."
-                        )
+                        raise pint.DimensionalityError(result_val.units, "dimensionless", extra_msg=f" for parameter '{fqn}'")
                     final_qty = result_val
                 else:
-                    # Parameter was declared with a dimension.
                     expected_unit = self._ureg.Unit(definition.declared_dimension_str)
                     if not result_val.is_compatible_with(expected_unit):
-                        raise pint.DimensionalityError(
-                            result_val.units, expected_unit,
-                            extra_msg=f" for expression '{definition.raw_value_or_expression_str}'"
-                        )
-                    # Always convert to the declared dimension for consistency.
+                        raise pint.DimensionalityError(result_val.units, expected_unit, extra_msg=f" for expression '{definition.raw_value_or_expression_str}'")
                     final_qty = result_val.to(expected_unit)
-                # --- END OF FIX #1 ---
 
                 self._parsed_constants[fqn] = final_qty
 
             except Exception as e:
                 if isinstance(e, ParameterError): raise
-                raise ParameterEvaluationError(fqn=fqn, details=str(e), error_indices=None, frequencies=None, input_values=eval_locals) from e
+                raise ParameterEvaluationError(fqn=fqn, details=str(e), error_indices=None, frequencies=None, input_values=self._parsed_constants) from e
 
     def _compute_and_cache_constant_flags(self):
         logger.debug("Computing and caching is_constant flags for all parameters...")
@@ -359,3 +447,33 @@ class ParameterManager:
             return self._parsed_constants[fqn]
         except KeyError:
             raise ParameterError(f"Internal Error: Constant '{fqn}' was not found in the pre-evaluation cache.") from None
+
+    def get_external_dependencies_of_scope(self, scope_fqns: Set[str]) -> Tuple[Set[str], Set[str]]:
+        self._check_build_complete()
+        const_deps = set()
+        freq_deps = set()
+
+        # This dependency graph only contains constant parameters now.
+        constant_graph = self._dependency_graph
+        all_deps = set()
+
+        for fqn in scope_fqns:
+            # Find dependencies for constant parameters via the graph
+            if fqn in constant_graph:
+                all_deps.update(nx.ancestors(constant_graph, fqn))
+            # Find dependencies for dynamic parameters by parsing their expression
+            elif not self.is_constant(fqn):
+                expression = self.get_parameter_definition(fqn).raw_value_or_expression_str
+                scope = self._scope_maps.get(fqn, ChainMap())
+                deps_from_expr = self._dependency_extractor.get_dependencies(expression)
+                for d in deps_from_expr:
+                    if d in scope:
+                        all_deps.add(scope[d])
+
+        for dep_fqn in all_deps:
+            if dep_fqn not in scope_fqns:
+                if self.is_constant(dep_fqn):
+                    const_deps.add(dep_fqn)
+                else:
+                    freq_deps.add(dep_fqn)
+        return const_deps, freq_deps

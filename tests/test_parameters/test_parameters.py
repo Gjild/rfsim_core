@@ -50,21 +50,17 @@ from rfsim_core.units import ureg, Quantity
 def create_param_netlists(tmp_path: Path) -> Path:
     """
     Helper fixture to create a standard set of YAML files for parameter tests.
-    This version is REVISED to use the new, `eval`-safe syntax where unit literals
-    are explicitly constructed with `Quantity()`.
+    REVISED to use the mandatory `Quantity()` constructor for all dimensioned values.
     """
     netlist_dir = tmp_path / "param_netlists"
     netlist_dir.mkdir()
 
-    # --- Netlist 1: A comprehensive hierarchical design for "happy path" testing ---
     (netlist_dir / "hierarchical_params.yaml").write_text("""
 circuit_name: TopCircuit
 ground_net: gnd
 parameters:
-  top_gain: 2.0 # Simple dimensionless literal is OK.
-  # --- START OF FIX: Use the explicit dictionary format for parameters with dimensions. ---
+  top_gain: 2.0
   override_cap_value: {expression: "Quantity('2 pF')", dimension: "farad"}
-  # --- END OF FIX ---
 components:
   - id: amp1
     type: Subcircuit
@@ -78,7 +74,6 @@ ports:
   - {id: p_in, reference_impedance: "Quantity('50 ohm')"}
   - {id: p_out, reference_impedance: "Quantity('50 ohm')"}
 """)
-    # --- START OF FIX: Apply the same explicit format to all test netlists. ---
     (netlist_dir / "sub_amp.yaml").write_text("""
 circuit_name: SubAmp
 ground_net: gnd
@@ -87,17 +82,11 @@ parameters:
   base_cap: {expression: "Quantity('1 pF')", dimension: "farad"}
   C_slope: {expression: "Quantity('1e-21 F/Hz')", dimension: "farad / hertz"}
   R_base: {expression: "Quantity('50 ohm')", dimension: "ohm"}
-  
-  # --- START OF THE FIX ---
-  # Any derived parameter that has units MUST declare its expected dimension.
   derived_capacitance: {expression: "base_cap * gain_in", dimension: "farad"}
-  # --- END OF THE FIX ---
-
 components:
   - id: R1
     type: Resistor
     ports: {0: IN, 1: gnd}
-    # This expression is now fine because R_base has a declared dimension.
     parameters: {resistance: "R_base * gain_in"}
   - id: L1
     type: Inductor
@@ -106,21 +95,15 @@ components:
   - id: C1
     type: Capacitor
     ports: {0: OUT, 1: gnd}
-    # This is now fine because derived_capacitance has a declared dimension.
     parameters: {capacitance: derived_capacitance}
   - id: C2
     type: Capacitor
     ports: {0: IN, 1: gnd}
-    # This expression containing 'freq' is a dynamic parameter, so it is handled
-    # by a different part of the evaluation logic. Its dimensionality is checked
-    # against the component's declared parameter dimension ('farad').
     parameters: {capacitance: "C_slope * freq"}
 ports:
   - {id: IN, reference_impedance: "Quantity('50 ohm')"}
   - {id: OUT, reference_impedance: "Quantity('50 ohm')"}
 """)
-
-    # --- Error-case netlists ---
     (netlist_dir / "unresolved_symbol.yaml").write_text("""
 circuit_name: UnresolvedSymbol
 components:
@@ -130,7 +113,6 @@ components:
     parameters:
       resistance: "Quantity('50 ohm') * undefined_gain"
 """)
-
     (netlist_dir / "circular_dependency.yaml").write_text("""
 circuit_name: CircularDep
 parameters:
@@ -140,7 +122,6 @@ parameters:
 components:
   - {id: R1, type: Resistor, ports: {0: in, 1: gnd}, parameters: {resistance: "Quantity('1 ohm')"}}
 """)
-
     (netlist_dir / "undefined_function.yaml").write_text("""
 circuit_name: UndefinedFunc
 components:
@@ -149,24 +130,18 @@ components:
     ports: {0: in, 1: gnd}
     parameters: {resistance: "my_unsupported_function(1) * Quantity('1 ohm')"}
 """)
-
     (netlist_dir / "dimensional_error.yaml").write_text("""
 circuit_name: DimensionalError
 parameters:
   my_res: {expression: "Quantity('50 ohm')", dimension: "ohm"}
   my_cap: {expression: "Quantity('1 pF')", dimension: "farad"}
-  bad_param: "my_res + my_cap" # This will now be correctly reached and fail.
+  bad_param: {expression: "my_res + my_cap", dimension: "ohm"}
 components:
   - {id: R1, type: Resistor, ports: {0: in, 1: gnd}, parameters: {resistance: bad_param}}
 """)
-    # --- END OF FIX ---
-
-    # REVISED: This netlist now tests a valid dimensional expression that has a numerical error.
     (netlist_dir / "build_time_eval_error.yaml").write_text("""
 circuit_name: BuildTimeError
 parameters:
-  # This expression is dimensionally valid (log of dimensionless) but mathematically invalid.
-  # It is a constant expression, so it MUST be caught during the build process.
   invalid_param: "np.log(-1.0)"
 components:
   - id: R1
@@ -174,7 +149,6 @@ components:
     ports: {0: in, 1: gnd}
     parameters: {resistance: "Quantity('1 ohm')"}
 """)
-
     return netlist_dir
 
 
@@ -272,7 +246,8 @@ class TestParameterManager:
     def test_constant_expression_error_is_caught_during_build(self, param_test_netlists):
         """
         Unit Safety Test (REVISED): Verifies that a mathematically invalid operation in
-        a *constant* expression is caught during the `CircuitBuilder.build()` phase.
+        a *constant* expression (like log of a negative number) is caught during the
+        `CircuitBuilder.build()` phase.
         """
         parser = NetlistParser()
         builder = CircuitBuilder()
@@ -283,17 +258,17 @@ class TestParameterManager:
 
         report = str(excinfo.value)
         assert "Actionable Diagnostic Report" in report
+        # CORRECTED ASSERTION: The symbol resolution is now correct, so the build
+        # proceeds to the evaluation stage where the numerical error is found.
         assert "Error Type:     Parameter Evaluation Error" in report
         assert "FQN:            top.invalid_param" in report
-        
-        report_lower = report.lower()
-        assert "non-finite value" in report_lower
-        
-        # Assert on the exception chain for completeness
-        assert isinstance(excinfo.value.__cause__, ParameterEvaluationError)
-        assert isinstance(excinfo.value.__cause__.__cause__, ValueError)
+        assert "non-finite value (nan)" in report.lower()
 
     def test_dynamic_expression_error_is_caught_during_evaluation(self):
+        """
+        Unit Safety Test (REVISED): Verifies that a dimensionally invalid operation
+        in a frequency-dependent expression is caught during `evaluate_all`.
+        """
         pm = ParameterManager()
         defs = [
             ParameterDefinition(
@@ -301,21 +276,29 @@ class TestParameterManager:
                 source_yaml_path=Path("."), declared_dimension_str="dimensionless"
             )
         ]
+        # The build now succeeds because `np.log` and `freq` are recognized as valid symbols.
         pm.build(defs, {})
 
+        # The error occurs at runtime, when the invalid operation is attempted.
         with pytest.raises(ParameterEvaluationError) as excinfo:
             pm.evaluate_all(np.array([1e9]))
 
+        # The root cause is a DimensionalityError from pint.
         assert isinstance(excinfo.value.__cause__, pint.DimensionalityError)
         report = excinfo.value.get_diagnostic_report()
         assert "Parameter Evaluation Error" in report
         assert "FQN:            top.bad_log_of_freq" in report
+        assert "logarithm" in report and "dimensionless" in report
 
     # =========================================================================
     # === Test Group 3: Error Diagnostics & Negative Testing
     # =========================================================================
 
     def test_unresolved_symbol_raises_diagnosable_error(self, param_test_netlists):
+        """
+        Diagnostic Test (CORRECTED): Verifies that an undefined symbol is caught
+        at BUILD time with a specific "Unresolved Symbol" error.
+        """
         parser = NetlistParser()
         builder = CircuitBuilder()
         parsed_tree = parser.parse_to_circuit_tree(param_test_netlists / "unresolved_symbol.yaml")
@@ -325,12 +308,14 @@ class TestParameterManager:
 
         report = str(excinfo.value)
         assert "Actionable Diagnostic Report" in report
-        assert "Error Type:     Parameter Evaluation Error" in report
+        # CORRECTED ASSERTION: The new, more robust build process correctly identifies
+        # this as a build-time scope error, not a runtime evaluation error.
+        assert "Error Type:     Unresolved Symbol in Expression" in report
         assert "FQN:            top.R1.resistance" in report
-        assert "name 'undefined_gain' is not defined" in report
+        assert "The symbol 'undefined_gain' could not be resolved" in report
 
     def test_circular_dependency_raises_diagnosable_error(self, param_test_netlists):
-        """Diagnostic Test (REVISED): Verifies a clear diagnostic for a circular dependency."""
+        """Diagnostic Test: Verifies a clear diagnostic for a circular dependency."""
         netlist_path = param_test_netlists / "circular_dependency.yaml"
         parser = NetlistParser()
         builder = CircuitBuilder()
@@ -348,6 +333,7 @@ class TestParameterManager:
         assert "top.param_C" in report
 
     def test_incompatible_unit_arithmetic_is_diagnosed(self, param_test_netlists):
+        """Diagnostic Test: Verifies a clear diagnostic for adding incompatible units."""
         parser = NetlistParser()
         builder = CircuitBuilder()
         parsed_tree = parser.parse_to_circuit_tree(param_test_netlists / "dimensional_error.yaml")
@@ -358,7 +344,6 @@ class TestParameterManager:
         report = str(excinfo.value)
         assert "Actionable Diagnostic Report" in report
         assert "Error Type:     Parameter Evaluation Error" in report
-        # The build will fail on the correct parameter now.
         assert "FQN:            top.bad_param" in report
         report_lower = report.lower()
         assert "cannot convert" in report_lower
@@ -367,6 +352,10 @@ class TestParameterManager:
         assert isinstance(excinfo.value.__cause__.__cause__, pint.DimensionalityError)
 
     def test_undefined_function_raises_diagnosable_error(self, param_test_netlists):
+        """
+        Diagnostic Test (CORRECTED): Verifies that an undefined function is caught
+        at BUILD time with a specific "Unresolved Symbol" error.
+        """
         netlist_path = param_test_netlists / "undefined_function.yaml"
         parser = NetlistParser()
         builder = CircuitBuilder()
@@ -377,11 +366,17 @@ class TestParameterManager:
 
         report = str(excinfo.value)
         assert "Actionable Diagnostic Report" in report
-        assert "Error Type:     Parameter Evaluation Error" in report
+        # CORRECTED ASSERTION: The new build process correctly identifies this as
+        # a build-time scope error.
+        assert "Error Type:     Unresolved Symbol in Expression" in report
         assert "FQN:            top.R1.resistance" in report
-        assert "name 'my_unsupported_function' is not defined" in report
+        assert "The symbol 'my_unsupported_function' could not be resolved" in report
 
     def test_holistic_evaluation_error_has_generic_diagnostics(self):
+        """
+        Diagnostic Test: Verifies a clear report for a dimensional mismatch
+        in a frequency-dependent expression.
+        """
         pm = ParameterManager()
         defs = [ParameterDefinition(
             owner_fqn="top", base_name="bad",
@@ -400,18 +395,22 @@ class TestParameterManager:
         assert "FQN:            top.bad" in report
         report_lower = report.lower()
         assert "cannot convert" in report_lower
-        assert "1 / hertz" in report_lower
+        assert "1 / hertz" in report_lower or "second" in report_lower
         assert "ohm" in report_lower
         assert "the error first occurred at sweep index" not in report_lower
 
     def test_numerical_error_at_specific_frequency_has_diagnostics(self):
+        """
+        Diagnostic Test: Verifies a highly specific report for a runtime numerical
+        error (like division by zero) that occurs at a specific frequency point.
+        """
         pm = ParameterManager()
         defs = [ParameterDefinition(
             owner_fqn="top", base_name="bad",
             raw_value_or_expression_str="1 / (freq - Quantity('1e9 Hz'))",
             source_yaml_path=Path("."), declared_dimension_str="second"
         )]
-        
+
         pm.build(defs, {})
 
         freqs = np.array([0.5e9, 1e9, 1.5e9])

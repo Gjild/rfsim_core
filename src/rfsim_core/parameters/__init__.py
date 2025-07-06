@@ -8,6 +8,7 @@ from .exceptions import (
     CircularParameterDependencyError,
 )
 from .parameters import ParameterManager, ParameterDefinition
+from .dependency_parser import ASTDependencyExtractor
 
 __all__ = [
     # Exceptions
@@ -20,4 +21,5 @@ __all__ = [
     # Core Classes
     "ParameterManager",
     "ParameterDefinition",
+    "ASTDependencyExtractor"
 ]
