@@ -7,7 +7,6 @@ from .exceptions import (
     ParameterEvaluationError,
     CircularParameterDependencyError,
 )
-from .preprocessor import ExpressionPreprocessor
 from .parameters import ParameterManager, ParameterDefinition
 
 __all__ = [
@@ -19,7 +18,6 @@ __all__ = [
     "ParameterEvaluationError",
     "CircularParameterDependencyError",
     # Core Classes
-    "ExpressionPreprocessor",
     "ParameterManager",
     "ParameterDefinition",
 ]

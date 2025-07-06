@@ -19,7 +19,7 @@ Architectural Significance:
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-
+import pint  # --- START OF FIX #3: ADDED MISSING IMPORT ---
 import numpy as np
 
 # This is the cornerstone import for the revised architecture.
@@ -170,28 +170,33 @@ class ParameterEvaluationError(ParameterError):
         Generates a highly detailed report, including the specific frequency and
         input values that caused the first failure in a vectorized evaluation.
         """
-        # Attempt to find the first point of failure for a rich diagnostic.
+        details_str = self.details
+
+        # --- REVISED LOGIC FOR DETAILED, PER-INDEX REPORTING ---
         if self.error_indices is not None and self.frequencies is not None and self.error_indices.size > 0:
             first_fail_idx = self.error_indices[0]
             first_fail_freq = self.frequencies[first_fail_idx]
 
-            # Extract the specific input values at the point of failure.
+            # REVISED: Filter the verbose context for a cleaner report.
+            RESERVED_EVAL_KEYS = {'ureg', 'Quantity', 'np', 'pi', '__builtins__'}
+            relevant_inputs = {k: v for k, v in self.input_values.items() if k not in RESERVED_EVAL_KEYS}
+
             input_vals_at_first_failure = {
                 name: val[first_fail_idx] if isinstance(val, np.ndarray) and val.ndim > 0 and val.size > first_fail_idx else val
-                for name, val in self.input_values.items()
+                for name, val in relevant_inputs.items()
             }
-            input_details = "\n".join(f"  - {name} = {val}" for name, val in input_vals_at_first_failure.items())
+            input_details = "\n".join(f"  - {name} = {val:~P}" if isinstance(val, pint.Quantity) else f"  - {name} = {val}" for name, val in input_vals_at_first_failure.items())
 
             details_str = (
                 f"{self.details}\n\n"
                 f"The error first occurred at sweep index {first_fail_idx} (frequency = {first_fail_freq:.4e} Hz) "
-                f"with the following input values:\n{input_details}"
+                f"with the following relevant input values:\n{input_details}"
             )
-            if self.error_indices.size > 1:
-                details_str += f"\n\nNote: This error occurred at {self.error_indices.size} total frequency points."
-        else:
-            # Fallback if specific index information is not available.
-            details_str = self.details
+
+            # REVISED: Corrected pluralization and off-by-one logic.
+            count = self.error_indices.size
+            plural_s = 's' if count > 1 else ''
+            details_str += f"\n\nNote: This error occurred at {count} total frequency point{plural_s}."
 
         return format_diagnostic_report(
             error_type="Parameter Evaluation Error",

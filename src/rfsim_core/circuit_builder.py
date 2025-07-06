@@ -138,12 +138,26 @@ class CircuitBuilder:
 
         # Process top-level parameters in the current circuit definition file
         for name, value_info in ir_node.raw_parameters_dict.items():
+
+            # --- START OF THE FIX ---
+            # Correctly handle the two allowed formats for a parameter value.
+            if isinstance(value_info, dict):
+                # Format is: {expression: "...", dimension: "..."}
+                expression_str = str(value_info.get('expression'))
+                dimension_str = str(value_info.get('dimension', 'dimensionless'))
+            else:
+                # Format is a simple string or number. Assume dimensionless by convention
+                # for these top-level "interface" parameters.
+                expression_str = str(value_info)
+                dimension_str = "dimensionless"
+            # --- END OF THE FIX ---
+
             param_def = ParameterDefinition(
                 owner_fqn=parent_fqn,
                 base_name=name,
-                raw_value_or_expression_str=str(value_info),
+                raw_value_or_expression_str=expression_str,
                 source_yaml_path=ir_node.source_yaml_path,
-                declared_dimension_str="dimensionless"  # Interface params are dimensionless by convention
+                declared_dimension_str=dimension_str
             )
             all_definitions.append(param_def)
             local_scope_map[name] = param_def.fqn
