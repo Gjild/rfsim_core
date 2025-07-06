@@ -130,7 +130,7 @@ class CircuitBuilder:
 
         # Process top-level parameters in the current circuit definition file
         for name, value_info in ir_node.raw_parameters_dict.items():
-            # DEFINITIVE FIX: Correctly handle the two allowed formats for a parameter value.
+            # This correctly handles the two allowed formats for a parameter value.
             if isinstance(value_info, dict):
                 # Format is: {expression: "...", dimension: "..."}
                 # This is the EXPLICIT and CORRECT way to define a parameter with a dimension.
@@ -215,7 +215,7 @@ class CircuitBuilder:
                     sub_definitions = [d for d in sub_definitions if d.fqn != original_def.fqn]
                     sub_definitions.append(override_def)
 
-                # DEFINITIVE FIX: Propagate sub-parameter names up to the parent scope
+                # This propagates sub-parameter names up to the parent scope
                 # so that they are visible to expressions in the parent circuit.
                 for sub_p_def in sub_definitions:
                     # e.g., create a key like 'X1.R_load.resistance' in the parent's scope
