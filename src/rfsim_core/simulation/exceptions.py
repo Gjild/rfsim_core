@@ -46,30 +46,6 @@ class MnaInputError(DiagnosableError):
 
 
 @dataclass()
-class ComponentError(DiagnosableError):
-    """
-
-    Raised when a specific component fails during its simulation calculations,
-    such as when provided with an invalid parameter value for a given frequency.
-    """
-    component_fqn: str
-    details: str
-    frequency: Optional[float] = None
-
-    def get_diagnostic_report(self) -> str:
-        """Generates the diagnostic report for a component simulation error."""
-        return format_diagnostic_report(
-            error_type="Component Simulation Error",
-            details=self.details,
-            suggestion="Check the component's parameters and ensure they are valid for the given frequency (e.g., non-negative resistance, real capacitance).",
-            context={
-                'fqn': self.component_fqn,
-                'frequency': f"{self.frequency:.4e} Hz" if self.frequency is not None else "N/A (DC or constant analysis)"
-            }
-        )
-
-
-@dataclass()
 class SingularMatrixError(DiagnosableError, np.linalg.LinAlgError):
     """
     Raised when a matrix is found to be singular during LU factorization.

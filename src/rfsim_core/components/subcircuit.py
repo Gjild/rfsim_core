@@ -3,34 +3,31 @@
 """
 Provides the concrete implementation for the hierarchical `SubcircuitInstance` component.
 
-**Architectural Refactoring (Phase 9):**
+**Architectural Refactoring (Definitive):**
 
-This module has been refactored to align with the capability-based component model,
-serving as a crucial validation of the new architecture's ability to handle complex,
-proxy-like components. The changes are as follows:
+This module has been fully refactored and hardened to align with the project's definitive
+architectural mandates. The changes are as follows:
 
-1.  **Cohesion of Implementation:** All logic related to a specific analysis domain
-    (e.g., MNA, DC) is now encapsulated within a dedicated, stateless, nested class
+1.  **Elimination of Fragile Asserts:** All `assert` statements used for runtime state
+    validation have been **REPLACED** with explicit `if/raise ComponentError` blocks. This
+    is a non-negotiable architectural requirement. It ensures that critical integrity checks
+    (e.g., verifying that a cache is populated) are not discardable by interpreter flags
+    (like `-O`) and that any failure generates a rich, actionable diagnostic report via
+    the `DiagnosableError` system, not a raw `AssertionError`.
+
+2.  **Cohesion of Implementation:** All logic related to a specific analysis domain
+    (e.g., MNA, DC) is encapsulated within a dedicated, stateless, nested class
     inside its parent component class (e.g., `Resistor.MnaContributor`). This makes
     the component's total functionality self-contained and highly discoverable.
 
-2.  **Declarative Registration:** The new `@provides` decorator is used on these
+3.  **Declarative Registration:** The `@provides` decorator is used on these
     nested classes to declaratively register them as implementers of a specific
     capability protocol (e.g., `IMnaContributor`). This automates discovery and
-    removes the burden of manual registration from the component author.
+    improves the developer experience for plugin authors.
 
-3.  **Decoupled Interface:** `SubcircuitInstance` no longer directly implements
-    analysis-specific methods like `get_mna_stamps`. Instead, it acts as a container
-    for its cached simulation results and a provider of capabilities. Analysis engines
-    query it via `component.get_capability(...)`, completing the decoupling of analysis
-    logic from the component's structure.
-
-4.  **Stateless Capability with Context:** The nested capability classes are stateless.
-    When their methods are invoked by an analysis engine, they receive the parent
-    `SubcircuitInstance` object as an explicit `component` argument. This provides all
-    necessary context, such as the `fqn` for error messages and access to the critical
-    `cached_y_parameters_ac` and `cached_dc_analysis_results` attributes, while
-    maintaining a clean, service-oriented design.
+4.  **Explicit Contracts:** The component now uses and relies on the formal, type-safe
+    `DCAnalysisResults` data contract for its DC cache, eliminating the use of fragile,
+    untyped dictionaries for this purpose.
 """
 
 import logging
@@ -48,9 +45,9 @@ from ..parser.raw_data import ParsedSubcircuitData
 from .base import (
     ComponentBase,
     register_component,
-    ComponentError,
     StampInfo,
 )
+from .exceptions import ComponentError
 from .base_enums import DCBehaviorType
 
 # --- Capability System Imports (The Heart of the New Architecture) ---
@@ -58,7 +55,7 @@ from .capabilities import IMnaContributor, IDcContributor, provides
 
 # --- Type Imports for Explicit Contracts ---
 # Use TYPE_CHECKING to import DCAnalysisResults only for type analysis,
-# preventing a circular import at runtime with analysis_tools.py.
+# preventing a circular import at runtime with analysis.results.
 if TYPE_CHECKING:
     # This import points to the new, formal result object in the 'analysis' package.
     from ..analysis.results import DCAnalysisResults
@@ -96,7 +93,7 @@ class SubcircuitInstance(ComponentBase):
             """
             Returns the N-port Y-matrix stamp from the pre-computed cache.
             """
-            # ROBUSTNESS ENHANCEMENT: Replaced assert with explicit check and diagnosable error.
+            # --- MANDATORY REMEDIATION: Replace fragile asserts with robust, diagnosable checks. ---
             if component.cached_y_parameters_ac is None:
                 raise ComponentError(
                     component_fqn=component.fqn,
@@ -109,8 +106,6 @@ class SubcircuitInstance(ComponentBase):
             num_freqs_cache, _, _ = component.cached_y_parameters_ac.shape
             num_freqs_sweep = len(freq_hz_array)
 
-            # NAMEERROR FIX & ROBUSTNESS ENHANCEMENT:
-            # Corrected `freq_array_hz` to `freq_hz_array` and replaced assert.
             if num_freqs_cache != num_freqs_sweep:
                 raise ComponentError(
                     component_fqn=component.fqn,
@@ -120,6 +115,7 @@ class SubcircuitInstance(ComponentBase):
                         "failure in the simulation executive or caching logic."
                     )
                 )
+            # --- END OF REMEDIATION ---
 
             admittance_matrix_qty = Quantity(
                 component.cached_y_parameters_ac, component.ureg.siemens
@@ -151,7 +147,7 @@ class SubcircuitInstance(ComponentBase):
             The returned DC Y-matrix MAY BE SINGULAR. It is the explicit responsibility
             of the consuming `DCAnalyzer` to handle this possibility robustly.
             """
-            # ROBUSTNESS ENHANCEMENT: Replaced assert with explicit check and diagnosable error.
+            # --- MANDATORY REMEDIATION: Replace fragile assert with robust, diagnosable check. ---
             if component.cached_dc_analysis_results is None:
                 raise ComponentError(
                     component_fqn=component.fqn,
@@ -160,6 +156,7 @@ class SubcircuitInstance(ComponentBase):
                         "This indicates a critical failure in the simulation executive."
                     )
                 )
+            # --- END OF REMEDIATION ---
 
             # This uses the new, explicit dataclass contract.
             y_ports_dc_qty = component.cached_dc_analysis_results.y_ports_dc

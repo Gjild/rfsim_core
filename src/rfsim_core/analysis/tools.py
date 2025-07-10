@@ -33,7 +33,8 @@ import networkx as nx
 import numpy as np
 from scipy.linalg import lu_factor, lu_solve
 
-from ..components.base import ComponentBase, ComponentError, DCBehaviorType
+from ..components.base import ComponentBase, DCBehaviorType
+from ..components.exceptions import ComponentError
 from ..components.capabilities import IDcContributor
 from ..components.subcircuit import SubcircuitInstance
 from ..data_structures import Circuit
@@ -296,7 +297,7 @@ class DCAnalyzer:
             dc_port_mapping = self._build_dc_port_mapping()
         except Exception as e:
             # Wrap any unexpected error in a diagnosable exception.
-            if isinstance(e, DCAnalysisError):  # Re-raise if already diagnosed
+            if isinstance(e, (DCAnalysisError, ComponentError)):
                 raise
             raise DCAnalysisError(
                 hierarchical_context=self.circuit.hierarchical_id,
@@ -342,7 +343,11 @@ class DCAnalyzer:
                     dc_behaviors[comp_id] = (behavior_type, admittance_qty)
                 else:
                     dc_behaviors[comp_id] = (DCBehaviorType.OPEN_CIRCUIT, None)
-            except (ComponentError, KeyError) as e:
+            except ComponentError as e:
+                # Re-raise the more specific, diagnosable error as-is.
+                raise e
+            except KeyError as e:
+                # Wrap a less-specific KeyError in a diagnosable DCAnalysisError.
                 details = f"Error getting DC behavior for component '{sim_comp.fqn}': {e}"
                 logger.error(details, exc_info=True)
                 raise DCAnalysisError(hierarchical_context=self.circuit.hierarchical_id, details=details) from e

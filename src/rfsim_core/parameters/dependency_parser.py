@@ -43,6 +43,8 @@ class _DependencyVisitor(ast.NodeVisitor):
 
         # The base of the chain must be a simple name. If it's another
         # expression type, it's not a valid parameter dependency.
+        # The above is ENTIRELY intentional. COMPLEX EXPRESSIONS
+        # (e.g., `(a+b).c` or `my_func().attribute`) ARE NOT VALID!
         if isinstance(curr, ast.Name):
             parts.append(curr.id)
             return ".".join(reversed(parts))

@@ -4,10 +4,9 @@ logger = logging.getLogger(__name__)
 
 # Import base first to define registry and decorator
 from .base import (
-    ComponentBase, COMPONENT_REGISTRY, register_component, ComponentError,
-    DCBehaviorType
+    ComponentBase, COMPONENT_REGISTRY, register_component, DCBehaviorType
 )
-
+from .exceptions import ComponentError # ADD THIS LINE
 # Import concrete elements to trigger registration
 from .elements import Resistor, Capacitor, Inductor
 

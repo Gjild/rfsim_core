@@ -44,7 +44,7 @@ from .engine import SimulationEngine
 # --- Explicit Result and Exception Contracts ---
 from .results import SimulationResult
 from ..analysis.results import DCAnalysisResults  # For type hinting run_simulation
-from ..errors import SimulationRunError, Diagnosable, format_diagnostic_report
+from ..errors import SimulationRunError, DiagnosableError, format_diagnostic_report
 from ..validation.exceptions import SemanticValidationError
 
 logger = logging.getLogger(__name__)
@@ -123,7 +123,7 @@ def run_sweep(
         # 7. Return the formal result and the cache instance, fulfilling the API contract.
         return result, effective_cache
 
-    except Diagnosable as e:
+    except DiagnosableError as e:
         # 8a. Catch any well-defined, diagnosable error from the build or run process.
         #     Extract its detailed report and wrap it in the top-level user-facing error.
         logger.error(f"A diagnosable error occurred during simulation: {e}")

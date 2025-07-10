@@ -10,7 +10,8 @@ from .exceptions import MnaInputError
 
 from ..data_structures import Circuit, Net
 from ..parser.raw_data import ParsedLeafComponentData, ParsedSubcircuitData
-from ..components.base import ComponentBase, ComponentError, StampInfo
+from ..components.base import ComponentBase, StampInfo
+from ..components.exceptions import ComponentError
 from ..components.subcircuit import SubcircuitInstance
 from ..units import ureg, Quantity
 from ..parameters import ParameterManager, ParameterError
@@ -199,7 +200,11 @@ class MnaAssembler:
                             add_value(r_idx, c_idx, stamp_matrix_scalar[i, j], comp_fqn)
 
             except Exception as e:
-                raise ComponentError(f"Stamping failed for '{comp_fqn}' at sweep index {current_sweep_idx}: {e}") from e
+                # FIX: Use keyword arguments to correctly instantiate the dataclass
+                raise ComponentError(
+                    component_fqn=comp_fqn,
+                    details=f"Stamping failed at sweep index {current_sweep_idx}: {e}"
+                ) from e
 
         Yn_full_coo = sp.coo_matrix((mna_data, (self._cached_rows, self._cached_cols)), shape=self._shape_full)
         return Yn_full_coo.tocsc()

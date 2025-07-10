@@ -37,6 +37,12 @@ PARAM_OVERRIDE_KEY_REGEX = f"^{ID_REGEX_FRAGMENT}(\\.{ID_REGEX_FRAGMENT})*$"
 
 class EnhancedValidator(cerberus.Validator):
     """Custom Cerberus validator to enforce the project's strict naming conventions."""
+    def __init__(self, *args, **kwargs):
+        super(EnhancedValidator, self).__init__(*args, **kwargs)
+        self.rules['id_regex'] = {'schema': {'type': 'boolean'}}
+        self.rules['param_override_key_regex'] = {'schema': {'type': 'boolean'}}
+        self.rules['unique_elements_by_key'] = {'schema': {'type': 'string'}}
+
     def _validate_id_regex(self, constraint: bool, field: str, value: Any):
         if not constraint: return
         if not isinstance(value, str):

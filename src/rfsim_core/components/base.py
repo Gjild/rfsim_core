@@ -18,11 +18,6 @@ from .base_enums import DCBehaviorType  # Import from the new, separated file.
 logger = logging.getLogger(__name__)
 
 
-class ComponentError(ValueError):
-    """Custom exception for component-related errors during simulation or analysis."""
-    pass
-
-
 # A type alias for MNA stamp information, retained for clarity.
 StampInfo = Tuple[Quantity, List[str | int]]
 
@@ -61,6 +56,13 @@ class ComponentBase(ABC):
         self.parameter_manager: ParameterManager = parameter_manager
         self.parent_hierarchical_id: str = parent_hierarchical_id
         self.raw_ir_data: ParsedComponentData = raw_ir_data
+
+        # --- MODIFICATION: Fulfill the instance attribute contract ---
+        # This makes the component's type string directly available on the instance,
+        # creating an explicit contract for validators and other tools.
+        self.component_type: str = raw_ir_data.component_type
+        # --- END OF MODIFICATION ---
+
         self.ureg = ureg
 
         # NEW: This instance-level cache is a critical performance optimization.
@@ -151,7 +153,7 @@ class ComponentBase(ABC):
             # 3. Instantiate the stateless capability object.
             # No arguments are passed; it's a stateless service object.
             instance = impl_class()
-            
+
             # 4. Cache the singleton instance and return it.
             self._capability_cache[capability_type] = instance
             return instance
@@ -209,7 +211,7 @@ class ComponentBase(ABC):
             True if the component acts as a permanent open circuit, False otherwise.
         """
         pass
-    
+
     # --- Concrete dunder methods for representation (REMAINING) ---
 
     def __str__(self) -> str:

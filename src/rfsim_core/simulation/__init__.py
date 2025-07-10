@@ -1,7 +1,6 @@
 # src/rfsim_core/simulation/__init__.py
 from .exceptions import (
     MnaInputError,
-    ComponentError,
     SingularMatrixError,
     SingleLevelSimulationFailure,
 )
@@ -12,7 +11,6 @@ from .execution import run_simulation, run_sweep
 __all__ = [
     # Exceptions
     "MnaInputError",
-    "ComponentError",
     "SingularMatrixError",
     "SingleLevelSimulationFailure",
     # Core Classes
