@@ -19,10 +19,18 @@ engine. Its primary responsibility is to perform the complex tasks of:
     objects with full context (FQN, source file, declared dimension), and
     passing them to the `ParameterManager`.
 
-3.  **Object Graph Synthesis:** Instantiating the final `Circuit`, `ComponentBase`,
-    and `SubcircuitInstance` objects, and correctly linking them together. This
-    includes the critical process of **Ground Unification**, where all nets
-    named "gnd" are mapped to a single, canonical `Net` object.
+3.  **Object Graph Synthesis & Contract Fulfillment:** Instantiating the final `Circuit`,
+    `ComponentBase`, and `SubcircuitInstance` objects, and correctly linking them
+    together. This includes the critical processes of:
+    a.  **Ground Unification:** Mapping all nets named "gnd" to a single,
+        canonical `Net` object.
+    b.  **Port-Net Mapping Contract:** Fulfilling the mandatory API contract by
+        providing each component instance with its specific port-to-net name
+        mapping.
+    c.  **Perfect Encapsulation:** Ensuring that the final simulation-ready component
+        objects DO NOT retain a link to their raw IR data. The `Circuit` object
+        itself retains the IR link solely for the `SemanticValidator`. This decouples
+        the component API from the parser's IR.
 
 4.  **Top-Level Error Handling:** Acting as the primary gatekeeper for build-time
     errors. It wraps its entire process in a robust error handler that catches
@@ -91,7 +99,6 @@ class CircuitBuilder:
             diagnostic_report = e.get_diagnostic_report()
             raise CircuitBuildError(diagnostic_report) from e
         
-        # DEFINITIVE FIX: Harden the generic exception handler.
         except Exception as e:
             # This is a defensive catch-all for unexpected errors. It now checks if the
             # error is a raw SyntaxError that may have escaped a subsystem and provides
@@ -133,13 +140,10 @@ class CircuitBuilder:
             # This correctly handles the two allowed formats for a parameter value.
             if isinstance(value_info, dict):
                 # Format is: {expression: "...", dimension: "..."}
-                # This is the EXPLICIT and CORRECT way to define a parameter with a dimension.
                 expression_str = str(value_info.get('expression'))
                 dimension_str = str(value_info.get('dimension', 'dimensionless'))
             else:
                 # Format is a simple key: value (e.g., gain: 2.0 or gain: other_param).
-                # This format is ONLY for dimensionless literals or expressions that
-                # are known to result in a dimensionless quantity. This is a non-negotiable contract.
                 expression_str = str(value_info)
                 dimension_str = "dimensionless"
 
@@ -207,8 +211,6 @@ class CircuitBuilder:
                         base_name=original_def.base_name,
                         raw_value_or_expression_str=str(override_value),
                         source_yaml_path=comp_ir.source_yaml_path,
-                        # CRITICAL: The declared dimension is sourced from the subcircuit's
-                        # original definition, not the override value.
                         declared_dimension_str=original_def.declared_dimension_str
                     )
                     # Replace the original definition with the override
@@ -216,9 +218,7 @@ class CircuitBuilder:
                     sub_definitions.append(override_def)
 
                 # This propagates sub-parameter names up to the parent scope
-                # so that they are visible to expressions in the parent circuit.
                 for sub_p_def in sub_definitions:
-                    # e.g., create a key like 'X1.R_load.resistance' in the parent's scope
                     relative_name = sub_p_def.fqn.replace(f"{parent_fqn}.", "", 1)
                     local_scope_map[relative_name] = sub_p_def.fqn
 
@@ -236,7 +236,8 @@ class CircuitBuilder:
     ) -> Circuit:
         """
         Recursively performs Pass 2: instantiating all simulation-ready objects.
-        This includes the critical Ground Unification process.
+        It instantiates component objects and provides them with their required 
+        context (like the port-to-net mapping) via their constructors. 
         """
         if ground_unification_map is None:
             # The ground unification map is created once at the top level and passed
@@ -268,11 +269,14 @@ class CircuitBuilder:
             if isinstance(comp_ir, ParsedLeafComponentData):
                 if comp_ir.component_type in COMPONENT_REGISTRY:
                     ComponentClass = COMPONENT_REGISTRY[comp_ir.component_type]
+                    # MANDATED CHANGE: Fulfill the purified ComponentBase constructor contract.
+                    # Pass ONLY the necessary information. Do NOT pass the raw IR object.
                     sim_components[comp_ir.instance_id] = ComponentClass(
                         instance_id=comp_ir.instance_id,
+                        component_type_str=comp_ir.component_type,
                         parameter_manager=global_pm,
                         parent_hierarchical_id=parent_fqn,
-                        raw_ir_data=comp_ir
+                        port_net_map=comp_ir.raw_ports_dict,
                     )
             elif isinstance(comp_ir, ParsedSubcircuitData):
                 sub_circuit_obj = self._synthesize_circuit_object_tree(
@@ -281,13 +285,15 @@ class CircuitBuilder:
                     parent_fqn=component_fqn,
                     ground_unification_map=ground_unification_map
                 )
+                # MANDATED CHANGE: Fulfill the purified SubcircuitInstance constructor contract.
                 sim_components[comp_ir.instance_id] = SubcircuitInstance(
                     instance_id=comp_ir.instance_id,
                     parameter_manager=global_pm,
                     sub_circuit_object_ref=sub_circuit_obj,
                     sub_circuit_external_port_names_ordered=sorted(list(sub_circuit_obj.external_ports.keys())),
                     parent_hierarchical_id=parent_fqn,
-                    raw_ir_data=comp_ir
+                    port_net_map=comp_ir.raw_port_mapping,
+                    raw_parameter_overrides=comp_ir.raw_parameter_overrides,
                 )
 
         external_ports = {p['id']: nets[p['id']] for p in ir_node.raw_external_ports_list}

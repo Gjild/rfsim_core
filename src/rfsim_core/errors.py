@@ -26,6 +26,19 @@ class SimulationRunError(RFSimError):
     """
     pass
 
+class FrameworkLogicError(RuntimeError):
+    """
+    Raised when an internal, non-negotiable invariant or pre-condition of the
+    simulation framework's logic is violated.
+
+    This exception indicates a bug within RFSim Core itself. It is not a user-
+    correctable error (like a schema validation or component parameter issue)
+    and is not intended to be caught and formatted into a user-facing diagnostic
+    report. Its purpose is to fail loudly and provide a clear traceback for
+    the framework developer.
+    """
+    pass
+
 
 # --- Diagnostic Protocol & Base Exception (The Explicit Contract) ---
 
@@ -59,7 +72,6 @@ class DiagnosableError(Exception, Diagnosable):
         Subclasses MUST implement this.
         """
         raise NotImplementedError
-
 
 # --- Stateless Formatting Utility ---
 

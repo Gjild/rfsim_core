@@ -17,16 +17,12 @@ from pathlib import Path
 from rfsim_core import CircuitBuilder, NetlistParser, CircuitBuildError
 
 
-# -----------------------------------------------------------------------------
-# --- Test Fixture Definition (CORRECTED) ---
-# -----------------------------------------------------------------------------
-
 @pytest.fixture(scope="module")
 def netlists_dir(tmp_path_factory):
     """
     A pytest fixture that creates a temporary directory with test netlists.
-    This runs ONCE per test module, providing the necessary files for all tests
-    in this file without recreating them for each test.
+    This version is corrected to be 100% compliant with the framework's
+    hardened API contracts.
     """
     root = tmp_path_factory.mktemp("build_tests")
 
@@ -34,22 +30,21 @@ def netlists_dir(tmp_path_factory):
     (root / "hierarchical_dependency.yaml").write_text("""
 circuit_name: HierarchicalConstantTest
 parameters:
-  # ===================== START OF THE FIX =====================
-  # Use the explicit dictionary format to declare the expected dimension.
-  # This removes the ambiguity that caused the DimensionalityError.
+  # This parameter is an expression and correctly uses the dictionary format.
   derived_resistance: {expression: "sub1.R_load.resistance * 2", dimension: "ohm"}
-  # ====================== END OF THE FIX ======================
 components:
   - id: sub1
     type: Subcircuit
     definition_file: ./sub_for_dep_test.yaml
-    ports: { IN: net_in, OUT: net_out }
+    ports: { IN: net_in, OUT: net_out } # Subcircuit port mapping is correct.
   - id: R_final
     type: Resistor
-    ports: { 0: net_out, 1: gnd }
+    ports: { p1: net_out, p2: gnd }
+    # This parameter refers to a pre-defined expression, which is correct.
     parameters: { resistance: derived_resistance }
 ports:
-  - {id: net_in, reference_impedance: "Quantity('50 ohm')"}
+  # CORRECTED: reference_impedance expects a simple string literal.
+  - {id: net_in, reference_impedance: "50 ohm"}
 """)
 
     (root / "sub_for_dep_test.yaml").write_text("""
@@ -57,33 +52,29 @@ circuit_name: SubForDepTest
 components:
   - id: R_load
     type: Resistor
-    ports: { 0: IN, 1: OUT }
-    # --- DEFINITIVE FIX: Use explicit Quantity constructor ---
+    ports: { p1: IN, p2: OUT }
     parameters: { resistance: "Quantity('100 ohm')" }
 ports:
-  - {id: IN, reference_impedance: "Quantity('50 ohm')"}
-  - {id: OUT, reference_impedance: "Quantity('50 ohm')"}
+  # CORRECTED: reference_impedance expects a simple string literal.
+  - {id: IN, reference_impedance: "50 ohm"}
+  - {id: OUT, reference_impedance: "50 ohm"}
 """)
 
     # --- Netlist for testing invalid syntax detection ---
     (root / "invalid_syntax.yaml").write_text("""
 circuit_name: InvalidSyntaxTest
 parameters:
+  # This is the invalid expression under test.
   bad_param: "5 + * 3"
 components:
   - id: R1
     type: Resistor
-    ports: { 0: in, 1: gnd }
-    # --- DEFINITIVE FIX: Use explicit Quantity constructor ---
+    ports: { p1: in, p2: gnd }
     parameters: { resistance: "Quantity('10 ohm')" }
 """)
 
     return root
 
-
-# -----------------------------------------------------------------------------
-# --- Test Cases (Unchanged) ---
-# -----------------------------------------------------------------------------
 
 def test_build_succeeds_with_hierarchical_dependency(netlists_dir: Path):
     """

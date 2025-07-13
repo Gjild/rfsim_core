@@ -12,35 +12,34 @@ from .issue_codes import SemanticIssueCode
 from ..components import COMPONENT_REGISTRY, ComponentBase, Resistor, Capacitor, Inductor
 from ..components.subcircuit import SubcircuitInstance
 from ..parameters import ParameterManager, ParameterScopeError, ParameterError
-from ..parser.raw_data import ParsedLeafComponentData, ParsedSubcircuitData
+# --- MODIFIED: The IR data types are now used as explicit function arguments ---
+from ..parser.raw_data import ParsedLeafComponentData, ParsedSubcircuitData, ParsedComponentData
+from .exceptions import SemanticValidationError
 
 
 logger = logging.getLogger(__name__)
 
 
-class SemanticValidationError(ValueError):
-    """
-    Custom exception raised when semantic validation detects one or more errors.
-    Contains a list of all error-level ValidationIssue objects.
-    """
-    def __init__(self, issues: List[ValidationIssue]):
-        self.issues: List[ValidationIssue] = [
-            issue for issue in issues if issue.level == ValidationIssueLevel.ERROR
-        ]
-        error_lines = [str(issue) for issue in self.issues]
-        summary_message = (
-            f"Semantic validation failed with {len(self.issues)} error(s):\n"
-            + "\n".join(f"  - {line}" for line in error_lines)
-        )
-        super().__init__(summary_message)
-
-
 class SemanticValidator:
     """
     Performs recursive semantic validation on a synthesized, hierarchical circuit model.
+
+    This service traverses the entire circuit object graph *after* it has been built
+    and *after* all constant parameters have been evaluated. It is the final gatekeeper
+    that checks for logical and topological inconsistencies that are impossible to
+    detect during the initial parsing and schema validation phase.
+
+    **Architectural Refinement:**
+    This implementation is architecturally pure. It does not rely on component instances
+    carrying a `.raw_ir_data` attribute. Instead, all validation methods that require
+    information from the original netlist file receive the corresponding IR data object
+    as an explicit argument. This enforces perfect encapsulation and Separation of Concerns.
     """
 
     def __init__(self, top_level_circuit: Circuit):
+        """
+        Initializes the validator with the top-level, fully synthesized circuit.
+        """
         if not isinstance(top_level_circuit, Circuit):
             raise TypeError("SemanticValidator requires a valid top-level Circuit object.")
         if not top_level_circuit.parameter_manager:
@@ -50,10 +49,19 @@ class SemanticValidator:
         self.issues: List[ValidationIssue] = []
         self._ureg = ureg
         self.pm: ParameterManager = top_level_circuit.parameter_manager
+        # This set prevents re-validating the same circuit definition if it's
+        # instantiated multiple times in the hierarchy.
         self._validated_circuit_defs: Set[str] = set()
 
     def validate(self) -> List[ValidationIssue]:
-        """Public entry point to start the recursive validation process."""
+        """
+        Public entry point to start the recursive validation process.
+
+        Returns:
+            A list of all `ValidationIssue` objects found (errors, warnings, and info).
+            The calling context (e.g., `run_sweep`) is responsible for checking if any
+            of these issues are ERROR-level and halting the simulation if necessary.
+        """
         self.issues = []
         self._validated_circuit_defs.clear()
         logger.info(f"Starting recursive semantic validation for '{self.top_level_circuit.name}'...")
@@ -70,7 +78,7 @@ class SemanticValidator:
         return self.issues
 
     def _add_issue(self, level: ValidationIssueLevel, code_enum: SemanticIssueCode, **kwargs):
-        """Helper to create and add a ValidationIssue with full context."""
+        """A stateless helper to create and add a ValidationIssue with full context."""
         comp_fqn = kwargs.get('component_fqn', kwargs.get('instance_fqn'))
         h_context = kwargs.get('hierarchical_context')
         
@@ -84,7 +92,7 @@ class SemanticValidator:
         ))
 
     def _validate_recursive(self, circuit_node: Circuit):
-        """The core recursive validation function."""
+        """The core recursive validation function that traverses the circuit hierarchy."""
         def_path_str = str(circuit_node.source_file_path)
         if def_path_str not in self._validated_circuit_defs:
             logger.debug(f"Validating context for '{circuit_node.hierarchical_id}' defined in '{def_path_str}'")
@@ -92,13 +100,17 @@ class SemanticValidator:
             self._check_external_ports_in_context(circuit_node)
             self._validated_circuit_defs.add(def_path_str)
 
-        for sim_comp in circuit_node.sim_components.values():
+        for comp_ir in circuit_node.raw_ir_root.components:
+            sim_comp = circuit_node.sim_components[comp_ir.instance_id]
             if isinstance(sim_comp, SubcircuitInstance):
-                self._check_subcircuit_instance(sim_comp)
+                # We now pass the corresponding IR object to the check method.
+                self._check_subcircuit_instance(sim_comp, comp_ir)
                 self._validate_recursive(sim_comp.sub_circuit_object)
             elif isinstance(sim_comp, ComponentBase):
-                self._check_leaf_component_instance(sim_comp)
+                # We now pass the corresponding IR object to the check method.
+                self._check_leaf_component_instance(sim_comp, comp_ir)
             else:
+                # This path should be unreachable in a correctly functioning system.
                 logger.warning(f"Object '{sim_comp.instance_id}' in sim_components is not a ComponentBase; skipping validation.")
 
     # --- Helper Methods ---
@@ -110,25 +122,26 @@ class SemanticValidator:
         """
         connections: Dict[str, List[Tuple[str, str]]] = {}
         
-        for sim_comp in circuit_node.sim_components.values():
+        for comp_ir in circuit_node.raw_ir_root.components:
+            component_fqn = f"{circuit_node.hierarchical_id}.{comp_ir.instance_id}"
             ports_map = {}
-            if hasattr(sim_comp, 'raw_ir_data'):
-                if isinstance(sim_comp, SubcircuitInstance):
-                    ports_map = sim_comp.raw_ir_data.raw_port_mapping
-                elif isinstance(sim_comp.raw_ir_data, ParsedLeafComponentData):
-                    ports_map = sim_comp.raw_ir_data.raw_ports_dict
+            if isinstance(comp_ir, ParsedSubcircuitData):
+                ports_map = comp_ir.raw_port_mapping
+            elif isinstance(comp_ir, ParsedLeafComponentData):
+                ports_map = comp_ir.raw_ports_dict
             
             for port_name, connected_net in ports_map.items():
                 if connected_net in circuit_node.nets:
                     if connected_net not in connections:
                         connections[connected_net] = []
-                    connections[connected_net].append((sim_comp.fqn, str(port_name)))
+                    # The system assumes `port_name` is a string after schema validation
+                    connections[connected_net].append((component_fqn, str(port_name)))
         return connections
 
     # --- Context-Level Checks (Run once per circuit definition) ---
     
     def _check_nets_in_context(self, circuit_node: Circuit):
-        """Validates nets for a given circuit definition."""
+        """Validates nets for a given circuit definition (e.g., floating, single-connection)."""
         net_connections = self._get_net_connection_counts(circuit_node)
         internal_nets = set(circuit_node.nets.keys()) - set(circuit_node.external_ports.keys()) - {circuit_node.ground_net_name}
 
@@ -149,7 +162,7 @@ class SemanticValidator:
                             net_name=circuit_node.ground_net_name, hierarchical_context=circuit_node.hierarchical_id)
 
     def _check_external_ports_in_context(self, circuit_node: Circuit):
-        """Validates the external port definitions of a circuit definition, including Z0."""
+        """Validates the external port definitions of a circuit, including Z0."""
         net_connections = self._get_net_connection_counts(circuit_node)
         raw_ports_info = {p['id']: p for p in circuit_node.raw_ir_root.raw_external_ports_list}
 
@@ -174,28 +187,31 @@ class SemanticValidator:
                                     net_name=port_name, hierarchical_context=circuit_node.hierarchical_id,
                                     value=z0_str, parsed_dimensionality=str(qty.dimensionality))
             except (pint.UndefinedUnitError, pint.DimensionalityError, ValueError):
-                pass # Assume it's a parameter reference; PM build failure is the source of truth for invalid refs.
+                # This value might be a parameter reference (e.g., "Z0_system").
+                # The ParameterManager is the source of truth for resolving this. If it
+                # fails, a ParameterScopeError will be raised during the build, which is
+                # the correct behavior. We don't need to flag an error here.
+                pass
 
     # --- Instance-Level Checks ---
 
-    def _check_leaf_component_instance(self, sim_comp: ComponentBase):
-        """Validates a single leaf component instance (R, L, C, etc.)."""
-        try:
-            assert hasattr(sim_comp, 'raw_ir_data') and isinstance(sim_comp.raw_ir_data, ParsedLeafComponentData), \
-                   f"Internal Contract Violated: Leaf component '{sim_comp.fqn}' is missing its 'raw_ir_data' link."
-        except AssertionError as e:
-            raise TypeError(str(e)) from e
-
-        comp_ir = sim_comp.raw_ir_data
+    def _check_leaf_component_instance(self, sim_comp: ComponentBase, comp_ir: ParsedLeafComponentData):
+        """
+        Validates a single leaf component instance (R, L, C, etc.).
         
+        Args:
+            sim_comp: The synthesized simulation component object.
+            comp_ir: The raw Intermediate Representation object for this component.
+        """
         if sim_comp.component_type not in COMPONENT_REGISTRY:
             self._add_issue(ValidationIssueLevel.ERROR, SemanticIssueCode.COMP_TYPE_001,
                             component_fqn=sim_comp.fqn, component_type=sim_comp.component_type,
                             available_types=list(COMPONENT_REGISTRY.keys()))
             return
 
-        declared_ports = {str(p) for p in type(sim_comp).declare_ports()}
-        used_ports = {str(p) for p in comp_ir.raw_ports_dict.keys()}
+        # The logic is a comparison between two sets of strings, relying on the hardened API contract.
+        declared_ports = set(type(sim_comp).declare_ports())
+        used_ports = set(comp_ir.raw_ports_dict.keys())
         
         if extra := sorted(list(used_ports - declared_ports)):
             self._add_issue(ValidationIssueLevel.ERROR, SemanticIssueCode.COMP_LEAF_PORT_DEF_UNDECLARED,
@@ -215,6 +231,7 @@ class SemanticValidator:
             self._add_issue(ValidationIssueLevel.ERROR, SemanticIssueCode.PARAM_LEAF_MISSING,
                             component_fqn=sim_comp.fqn, parameter_name=missing[0], declared_params=sorted(list(declared_names)))
 
+        # Check dimensional consistency of constant parameters
         for name, expected_dim in declared_params.items():
             param_fqn = f"{sim_comp.fqn}.{name}"
             if self.pm.is_constant(param_fqn):
@@ -224,14 +241,22 @@ class SemanticValidator:
                         self._add_issue(ValidationIssueLevel.ERROR, SemanticIssueCode.PARAM_LEAF_DIM_MISMATCH,
                                         component_fqn=sim_comp.fqn, parameter_name=name,
                                         resolved_value_str=f"{const_val:~P}", expected_dim_str=expected_dim)
+                    # Check for ideal DC behaviors to provide informational messages.
                     self._check_and_report_dc_behavior(sim_comp, name, const_val)
                 except ParameterError:
+                    # A constant that cannot be evaluated would have already caused a
+                    # hard failure in ParameterManager.build(). We can safely pass here.
                     pass
 
-    def _check_subcircuit_instance(self, sub_inst: SubcircuitInstance):
-        """Performs the subcircuit-specific validation checks."""
+    def _check_subcircuit_instance(self, sub_inst: SubcircuitInstance, instance_ir: ParsedSubcircuitData):
+        """
+        Performs the subcircuit-specific validation checks.
+
+        Args:
+            sub_inst: The synthesized subcircuit instance object.
+            instance_ir: The raw Intermediate Representation for this instance.
+        """
         sub_def = sub_inst.sub_circuit_object
-        instance_ir = sub_inst.raw_ir_data
         instance_fqn = sub_inst.fqn
 
         declared_sub_ports = set(sub_def.external_ports.keys())
@@ -254,7 +279,7 @@ class SemanticValidator:
             target_fqn_in_sub = f"{sub_inst.fqn}.{key}"
             try:
                 p_def = self.pm.get_parameter_definition(target_fqn_in_sub)
-                if not isinstance(value, dict):
+                if not isinstance(value, dict): # Check only for literal overrides, not expressions
                     try:
                         qty = self._ureg.Quantity(str(value))
                         if not qty.is_compatible_with(p_def.declared_dimension_str):
@@ -263,8 +288,10 @@ class SemanticValidator:
                                             override_value_str=str(value), provided_dim_str=str(qty.dimensionality),
                                             expected_dim_str=p_def.declared_dimension_str)
                     except (pint.UndefinedUnitError, ValueError):
+                        # This is an expression or reference, handled by ParameterManager.
                         pass
             except ParameterScopeError:
+                # This case is handled by CircuitBuilder, but we keep it for defense-in-depth.
                 self._add_issue(ValidationIssueLevel.ERROR, SemanticIssueCode.SUB_INST_PARAM_OVERRIDE_UNDECLARED,
                                 instance_fqn=instance_fqn, override_target_in_sub=key)
 

@@ -39,16 +39,16 @@ class DCAnalysisResults:
     This object is the explicit contract between the DCAnalyzer and its consumers.
     It is immutable (frozen) to ensure correctness after creation.
 
-    ARCHITECTURAL REFINEMENT: This dataclass is designed to be a fully
-    self-contained record. The inclusion of `ground_supernode_name` ensures
-    that consumers of this result do not need to refer back to the DCAnalyzer
-    instance that created it, achieving complete decoupling.
+    This dataclass is designed to be a fully self-contained record. 
+    The inclusion of `ground_supernode_name` ensures that consumers of this 
+    result do not need to refer back to the DCAnalyzer instance that created it, 
+    achieving complete decoupling.
     """
     y_ports_dc: Optional[Quantity]
     dc_port_names_ordered: List[str]
     dc_port_mapping: Dict[str, Optional[int]]
     dc_supernode_mapping: Dict[str, str]
-    ground_supernode_name: Optional[str]  # REFINEMENT: Added for full decoupling.
+    ground_supernode_name: Optional[str]
 
 
 @dataclass(frozen=True)

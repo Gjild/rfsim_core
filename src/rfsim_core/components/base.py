@@ -1,7 +1,7 @@
 # src/rfsim_core/components/base.py
 
 import logging
-import inspect  # NEW: For robust class hierarchy inspection.
+import inspect
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Tuple, ClassVar, Optional, Type
 
@@ -9,17 +9,18 @@ import numpy as np
 
 from ..units import ureg, Quantity
 from ..parameters import ParameterManager
-from ..parser.raw_data import ParsedComponentData
-# --- NEW IMPORTS: The core of the capability system ---
-from .capabilities import ComponentCapability, TCapability, IMnaContributor, IDcContributor
-from .base_enums import DCBehaviorType  # Import from the new, separated file.
+from .capabilities import (
+    ComponentCapability, TCapability, IMnaContributor, IDcContributor,
+    ITopologyContributor, IConnectivityProvider, provides
+)
+from .base_enums import DCBehaviorType
 
 
 logger = logging.getLogger(__name__)
 
-
-# A type alias for MNA stamp information, retained for clarity.
-StampInfo = Tuple[Quantity, List[str | int]]
+# The port identifiers in this tuple are now EXCLUSIVELY strings,
+# a non-negotiable contract for type safety and clarity.
+StampInfo = Tuple[Quantity, List[str]]
 
 
 class ComponentBase(ABC):
@@ -28,7 +29,6 @@ class ComponentBase(ABC):
 
     This class establishes the fundamental contract for component identity,
     parameter declaration, and, most importantly, provides the queryable
-
     capability system that decouples components from analysis engines. It serves
     as a provider of capabilities rather than a monolithic implementation of
     all possible analysis behaviors.
@@ -38,37 +38,41 @@ class ComponentBase(ABC):
     def __init__(
         self,
         instance_id: str,
+        component_type_str: str,
         parameter_manager: ParameterManager,
         parent_hierarchical_id: str,
-        raw_ir_data: ParsedComponentData
+        port_net_map: Dict[str, str],
     ):
         """
         Initializes the base attributes of a component instance.
 
         Args:
             instance_id: The unique ID of this component instance (e.g., 'R1').
+            component_type_str: The component type identifier string (e.g., 'Resistor').
+                                This is an explicit part of the contract, provided
+                                by the CircuitBuilder.
             parameter_manager: The single, global ParameterManager for the simulation.
             parent_hierarchical_id: The FQN of the circuit containing this component.
-            raw_ir_data: A link to the raw, parsed data for this specific instance,
-                         essential for validation and diagnostics.
+            port_net_map: A dictionary mapping this instance's canonical port names
+                          (e.g., 'p1') to the net names of the circuit it is placed
+                          in (e.g., 'net_in'). This is a non-negotiable part of the
+                          component contract.
         """
         self.instance_id: str = instance_id
         self.parameter_manager: ParameterManager = parameter_manager
         self.parent_hierarchical_id: str = parent_hierarchical_id
-        self.raw_ir_data: ParsedComponentData = raw_ir_data
 
-        # --- MODIFICATION: Fulfill the instance attribute contract ---
-        # This makes the component's type string directly available on the instance,
-        # creating an explicit contract for validators and other tools.
-        self.component_type: str = raw_ir_data.component_type
-        # --- END OF MODIFICATION ---
+        # The port-to-net mapping is the sole source of connectivity truth.
+        self._port_net_map = port_net_map
+
+        # The component's type string is now an explicit, constructor-provided contract.
+        self.component_type: str = component_type_str
 
         self.ureg = ureg
 
-        # NEW: This instance-level cache is a critical performance optimization.
+        # This instance-level cache is a critical performance optimization.
         # It ensures that for a given component instance, each capability object
-        # is created only ONCE on its first request. This amortizes the cost
-        # of discovery and instantiation across the entire simulation.
+        # is created only ONCE on its first request.
         self._capability_cache: Dict[Type[ComponentCapability], ComponentCapability] = {}
         logger.debug(f"Initialized {type(self).__name__} '{self.fqn}'")
 
@@ -84,13 +88,43 @@ class ComponentBase(ABC):
         """A list of the fully qualified names for this component's parameters."""
         return [f"{self.fqn}.{base_name}" for base_name in self.declare_parameters()]
 
-    # --- DELETED: The old, monolithic abstract methods have been removed. ---
-    # @abstractmethod
-    # def get_mna_stamps(...) -> List[StampInfo]: ...
-    # @abstractmethod
-    # def get_dc_behavior(...) -> Tuple[DCBehaviorType, Optional[Quantity]]: ...
+    def get_port_net_mapping(self) -> Dict[str, str]:
+        """
+        Returns a dictionary mapping this instance's canonical port names
+        (e.g., 'p1') to the net names of the circuit it is placed in
+        (e.g., 'net_in'). This is the formal contract for retrieving
+        connectivity information, populated by the CircuitBuilder.
+        """
+        return self._port_net_map
 
-    # --- NEW: The core methods of the capability system. ---
+    @provides(IConnectivityProvider)
+    class ConnectivityProvider:
+        """
+        Default implementation of the IConnectivityProvider capability.
+
+        **ARCHITECTURAL REFINEMENT (Finding 2):**
+        This implementation has been made stricter to enforce correctness.
+        - For 2-port components, it correctly returns pairwise connectivity.
+        - For components with >2 ports, it returns NO connectivity (`[]`) and logs
+          an ERROR. This is a non-negotiable change that FORCES authors of N-port
+          components (e.g., couplers, circulators) to provide their own, correct
+          `IConnectivityProvider` capability. This prevents silent topological
+          errors and upholds the "Correctness by Construction" mandate.
+        """
+        def get_connectivity(self, component: "ComponentBase") -> List[Tuple[str, str]]:
+            ports = type(component).declare_ports()
+            if len(ports) == 2:
+                return [(ports[0], ports[1])]
+            
+            # For 0, 1, or >2 ports, return no connectivity by default.
+            # This FORCES N-port component authors to be explicit.
+            if len(ports) > 2:
+                logger.error(
+                    f"Component type '{type(component).component_type_str}' has > 2 ports but uses the default "
+                    f"IConnectivityProvider, which assumes no internal connections. You MUST provide a custom "
+                    f"capability implementation for correct N-port topology."
+                )
+            return []
 
     @classmethod
     def declare_capabilities(cls) -> Dict[Type[ComponentCapability], Type]:
@@ -109,11 +143,8 @@ class ComponentBase(ABC):
             nested class that provides its implementation.
         """
         discovered_capabilities = {}
-        # We iterate through the MRO to correctly handle inheritance. The MRO
-        # is ordered from the class itself to its parents, so the first
-        # implementation found for a given protocol is the most specific one.
+        # We iterate through the MRO to correctly handle inheritance.
         for base_class in cls.__mro__:
-            # Use inspect.getmembers to find all members of the class.
             for _, member_obj in inspect.getmembers(base_class):
                 # Check for the magic attribute set by the @provides decorator.
                 if hasattr(member_obj, '_implements_capability'):
@@ -128,11 +159,7 @@ class ComponentBase(ABC):
         Queries the component instance for a specific capability.
 
         This is the sole, public-facing entry point for all analysis engines.
-        It implements a lazy-loading and caching pattern:
-        1. Checks the instance-level cache for an existing capability object.
-        2. If not found, it calls the class-level discovery method.
-        3. If declared, it instantiates the stateless capability implementation class.
-        4. The new instance is cached for future requests and returned.
+        It implements a lazy-loading and caching pattern.
 
         Args:
             capability_type: The Protocol class representing the desired capability
@@ -141,27 +168,18 @@ class ComponentBase(ABC):
         Returns:
             An instance of the capability implementation if supported, otherwise `None`.
         """
-        # 1. Check instance cache first for maximum performance.
         if capability_type in self._capability_cache:
             return self._capability_cache[capability_type]
 
-        # 2. On cache miss, consult the class-level declaration via discovery.
         declared = type(self).declare_capabilities()
         impl_class = declared.get(capability_type)
 
         if impl_class:
-            # 3. Instantiate the stateless capability object.
-            # No arguments are passed; it's a stateless service object.
             instance = impl_class()
-
-            # 4. Cache the singleton instance and return it.
             self._capability_cache[capability_type] = instance
             return instance
 
-        # Return None if the component does not support this capability.
         return None
-
-    # --- Abstract methods for core component definition (REMAINING) ---
 
     @classmethod
     @abstractmethod
@@ -171,48 +189,17 @@ class ComponentBase(ABC):
 
     @classmethod
     @abstractmethod
-    def declare_ports(cls) -> List[str | int]:
-        """Declare the names/indices of the component's connection ports."""
-        pass
-
-    @classmethod
-    def declare_connectivity(cls) -> List[Tuple[str | int, str | int]]:
+    def declare_ports(cls) -> List[str]:
         """
-        Declare internal connectivity between ports for MNA sparsity pattern prediction.
-        The default implementation assumes full connectivity for components with >2 ports.
-        Override for performance with sparsely-connected multi-port components.
-        """
-        ports = cls.declare_ports()
-        if len(ports) == 2:
-            return [(ports[0], ports[1])]
-        elif len(ports) < 2:
-            return []
-        else:
-            logger.warning(
-                f"Component type '{cls.component_type_str}' has > 2 ports ({ports}) but "
-                f"uses default pairwise connectivity. Override declare_connectivity() "
-                f"for accurate sparsity."
-            )
-            from itertools import combinations
-            return list(combinations(ports, 2))
+        Declare the canonical, string-based names of the component's connection ports.
 
-    @abstractmethod
-    def is_structurally_open(self, resolved_constant_params: Dict[str, Quantity]) -> bool:
-        """
-        Determine if the component is a structural open based on constant parameters.
-        This is used for pre-simulation topological analysis to identify and remove
-        floating sub-circuits, improving performance and robustness.
+        This is a non-negotiable contract that enforces the "Universal String-Based
+        Identifier" mandate. Allowing mixed types (e.g., integers) is forbidden as
+        it creates ambiguity and downstream complexity.
 
-        Args:
-            resolved_constant_params: A dictionary of this component's constant
-                                      parameter values, already resolved.
-
-        Returns:
-            True if the component acts as a permanent open circuit, False otherwise.
+        For a standard 2-port element, this method MUST return, for example, `['p1', 'p2']`.
         """
         pass
-
-    # --- Concrete dunder methods for representation (REMAINING) ---
 
     def __str__(self) -> str:
         return f"{type(self).__name__}('{self.fqn}')"
@@ -221,9 +208,10 @@ class ComponentBase(ABC):
         return f"{type(self).__name__}(fqn='{self.fqn}')"
 
 
-# --- Global Component Registry and Decorator (REMAINING) ---
+# --- Global Component Registry and Decorator ---
 
 COMPONENT_REGISTRY: Dict[str, type[ComponentBase]] = {}
+
 
 def register_component(type_str: str):
     """
@@ -233,6 +221,41 @@ def register_component(type_str: str):
     def decorator(cls: type[ComponentBase]):
         if not issubclass(cls, ComponentBase):
             raise TypeError(f"Class {cls.__name__} must inherit from ComponentBase.")
+
+        # --- VALIDATION FOR 'declare_ports' ---
+        try:
+            ports = cls.declare_ports()
+            if not isinstance(ports, list) or not all(isinstance(p, str) and p for p in ports):
+                raise TypeError(
+                    f"Component class '{cls.__name__}' violates API contract. "
+                    f"declare_ports() must return a list of non-empty strings, but returned: {ports}."
+                )
+            # Enforce port name uniqueness at build time.
+            if len(set(ports)) != len(ports):
+                raise TypeError(
+                    f"Component class '{cls.__name__}' violates API contract. "
+                    f"declare_ports() must return a list of unique strings, but found duplicates in: {ports}."
+                )
+        except Exception as e:
+            raise TypeError(
+                f"A failure occurred while attempting to validate the API contract of "
+                f"component class '{cls.__name__}'. Error during call to declare_ports(): {e}"
+            ) from e
+
+        # Enforce 'declare_parameters' contract at build time.
+        try:
+            params = cls.declare_parameters()
+            if not isinstance(params, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in params.items()):
+                 raise TypeError(
+                    f"Component class '{cls.__name__}' violates API contract. "
+                    f"declare_parameters() must return a Dict[str, str], but returned a value of type '{type(params).__name__}'."
+                )
+        except Exception as e:
+            raise TypeError(
+                f"A failure occurred while attempting to validate the API contract of "
+                f"component class '{cls.__name__}'. Error during call to declare_parameters(): {e}"
+            ) from e
+
         if type_str in COMPONENT_REGISTRY:
             logger.warning(f"Component type '{type_str}' is being redefined/overwritten.")
         cls.component_type_str = type_str

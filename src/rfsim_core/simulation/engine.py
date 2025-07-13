@@ -1,16 +1,12 @@
 # src/rfsim_core/simulation/engine.py
+
 """
 Defines the `SimulationEngine`, the stateless service that orchestrates the simulation.
 
-This module is the heart of the new service-oriented architecture. The SimulationEngine
+This module is the heart of the service-oriented architecture. The SimulationEngine
 contains all the imperative logic for running a hierarchical simulation (the "how"),
 but it holds no state of its own. It operates on a `SimulationContext` object (the "what")
 that is passed to it upon creation.
-
-The logic within this engine's methods has been **relocated** from the previous
-procedural functions in `execution.py` and **adapted** to use the new service-based
-patterns (Dependency Injection for the cache) and explicit data contracts (the formal
-result objects from `analysis.results` and `simulation.results`).
 """
 import logging
 import numpy as np
@@ -23,16 +19,16 @@ from ..components.capabilities import IMnaContributor
 from ..parameters import ParameterError
 from ..constants import LARGE_ADMITTANCE_SIEMENS
 
-# --- Corrected and Hardened Imports ---
 from .mna import MnaAssembler
-from .solver import factorize_mna_matrix, solve_mna_system
-# MANDATORY: Import all necessary types for contract validation.
+from .solver import factorize_mna_matrix
 from ..units import ureg, Quantity, ADMITTANCE_DIMENSIONALITY
 
-# --- New, Explicit Imports for the Service-Oriented Architecture ---
 from .context import SimulationContext
 from .results import SubcircuitSimResults
-from ..analysis import DCAnalysisResults, DCAnalyzer, TopologyAnalyzer
+# --- REFINED IMPORTS: Explicitly import all required analysis contracts and services ---
+from ..analysis import (
+    DCAnalysisResults, DCAnalyzer, TopologyAnalyzer, TopologyAnalysisResults
+)
 from ..cache import create_subcircuit_sim_key, SimulationCache
 from .exceptions import (
     MnaInputError,
@@ -41,6 +37,7 @@ from .exceptions import (
 )
 from ..analysis.exceptions import DCAnalysisError
 from ..components.exceptions import ComponentError
+from ..errors import FrameworkLogicError
 
 
 logger = logging.getLogger(__name__)
@@ -62,7 +59,7 @@ class SimulationEngine:
         self.context: SimulationContext = context
         self.circuit: Circuit = context.top_level_circuit
         self.freq_array_hz: np.ndarray = context.freq_array_hz
-        self.cache: SimulationCache = context.cache  # Dependency Injection
+        self.cache: SimulationCache = context.cache
         self.global_pm = self.circuit.parameter_manager
         self.ureg = ureg
         logger.debug(f"SimulationEngine initialized for '{self.circuit.name}'.")
@@ -81,8 +78,9 @@ class SimulationEngine:
 
     def _populate_subcircuit_caches_recursive(self, circuit_node: Circuit):
         """
-        MOVED from execution.py. Recursively simulates subcircuits and populates the
-        'run' scope of the cache with formal `SubcircuitSimResults` objects.
+        Recursively simulates subcircuits and populates the 'run' scope of the
+        cache with formal `SubcircuitSimResults` objects, which now include
+        topology, DC, and AC results.
         """
         for sim_comp in circuit_node.sim_components.values():
             if isinstance(sim_comp, SubcircuitInstance):
@@ -100,23 +98,53 @@ class SimulationEngine:
                     results_to_use = cached_results
                 else:
                     logger.info(f"Cache MISS for '{sim_comp.fqn}'. Simulating definition '{sim_comp.sub_circuit_object.name}'.")
+                    
+                    sub_circuit_def = sim_comp.sub_circuit_object
+                    
+                    # Perform topology analysis for the subcircuit.
+                    # This is efficient because TopologyAnalyzer uses the persistent process-level cache.
+                    sub_topo_analyzer = TopologyAnalyzer(sub_circuit_def, self.cache)
+                    sub_topo_results = sub_topo_analyzer.analyze()
+
                     # On miss, run the simulation for the subcircuit's definition.
-                    y_mats, dc_res = self._run_single_level_simulation(sim_comp.sub_circuit_object)
-                    # Package the results into the formal, type-safe dataclass.
-                    results_to_use = SubcircuitSimResults(y_parameters=y_mats, dc_results=dc_res)
+                    y_mats, dc_res = self._run_single_level_simulation(sub_circuit_def)
+                    
+                    # Package ALL results into the formal dataclass.
+                    results_to_use = SubcircuitSimResults(
+                        y_parameters=y_mats,
+                        dc_results=dc_res,
+                        topology_results=sub_topo_results
+                    )
+                    
                     # Store the formal result object in the cache.
                     self.cache.put(key=cache_key, value=results_to_use, scope='run')
 
-                # Populate the subcircuit instance's internal attributes from the formal result object.
+                # Populate all cached attributes on the instance for use by its capabilities.
                 sim_comp.cached_y_parameters_ac = results_to_use.y_parameters
                 sim_comp.cached_dc_analysis_results = results_to_use.dc_results
+                sim_comp.cached_topology_results = results_to_use.topology_results
 
     def _run_single_level_simulation(self, circuit: Circuit) -> Tuple[np.ndarray, Optional[DCAnalysisResults]]:
         """
-        MOVED and ADAPTED from execution.py. Runs a full simulation for a single circuit level.
-        This method now uses the cache-aware analysis services via dependency injection.
+        Runs a full simulation for a single circuit level.
+        This method uses cache-aware analysis services via dependency injection and enforces
+        all component API contracts via the Validation Gateway.
         """
         logger.info(f"--- Running single-level simulation for '{circuit.hierarchical_id}' ({len(self.freq_array_hz)} points) ---")
+        
+        # --- FRAMEWORK INTEGRITY CHECK ---
+        # This is a non-negotiable pre-condition. The engine verifies its own orchestration
+        # logic by ensuring all sub-dependency caches have been populated.
+        for sim_comp in circuit.sim_components.values():
+            if isinstance(sim_comp, SubcircuitInstance):
+                # Check all required cached attributes. A failure here is a bug in the engine.
+                if sim_comp.cached_dc_analysis_results is None or sim_comp.cached_topology_results is None:
+                    raise FrameworkLogicError(
+                        f"Pre-condition failed for simulating '{circuit.hierarchical_id}': "
+                        f"The cache for subcircuit instance '{sim_comp.fqn}' was not populated. "
+                        "This indicates a critical bug in the SimulationEngine's recursive traversal logic."
+                    )
+
         try:
             # 1. Instantiate analysis services, injecting the cache.
             dc_analyzer = DCAnalyzer(circuit, self.cache)
@@ -140,43 +168,66 @@ class SimulationEngine:
             y_matrices = np.full((len(self.freq_array_hz), num_ac_ports, num_ac_ports), np.nan + 0j, dtype=np.complex128)
 
             all_evaluated_params = circuit.parameter_manager.evaluate_all(self.freq_array_hz)
-            all_stamps_vectorized: Dict[str, List[Tuple[Quantity, List[str | int]]]] = {}
+            
+            # The dictionary now stores a single tuple per component, not a list.
+            all_stamps_vectorized: Dict[str, Tuple[Quantity, List[str]]] = {}
             for comp_fqn, sim_comp in assembler.effective_sim_components.items():
                 mna_contributor = sim_comp.get_capability(IMnaContributor)
                 if mna_contributor:
                     try:
-                        stamps = mna_contributor.get_mna_stamps(sim_comp, self.freq_array_hz, all_evaluated_params)
+                        # Step 1: Call the untrusted plugin capability to get the stamp tuple.
+                        stamp_info = mna_contributor.get_mna_stamps(
+                            sim_comp, self.freq_array_hz, all_evaluated_params
+                        )
                         
-                        # --- MANDATORY FIX: THE FRAMEWORK MUST ENFORCE ITS CONTRACTS ---
-                        # This validation block acts as a gateway, ensuring no malformed data
-                        # from a component can propagate deeper into the system.
+                        # --- NON-NEGOTIABLE VALIDATION GATEWAY ---
+                        # The framework MUST enforce its contracts at the boundary.
+                        if not (isinstance(stamp_info, tuple) and len(stamp_info) == 2):
+                            raise ComponentError(
+                                component_fqn=comp_fqn,
+                                details=(f"MNA capability expected to return a 2-element tuple (Quantity, List[str]), "
+                                         f"but returned type '{type(stamp_info).__name__}'.")
+                            )
+                        
+                        y_qty, port_list = stamp_info
+                        
+                        
+                        if not isinstance(y_qty, Quantity):
+                            raise ComponentError(
+                                component_fqn=comp_fqn,
+                                details=f"Stamp value is not a pint.Quantity object, but type '{type(y_qty).__name__}'."
+                            )
+                        
+                        if y_qty.dimensionality != ADMITTANCE_DIMENSIONALITY:
+                            raise ComponentError(
+                                component_fqn=comp_fqn,
+                                details=(f"Stamp has incorrect physical dimension. Expected [admittance], "
+                                         f"but got {y_qty.dimensionality}.")
+                            ) from pint.DimensionalityError(y_qty.units, self.ureg.siemens)
+                        
+                        y_mag = y_qty.magnitude
+                        if not isinstance(y_mag, np.ndarray) or y_mag.ndim != 3:
+                            raise ComponentError(
+                                component_fqn=comp_fqn,
+                                details=f"Stamp magnitude must be a 3D NumPy array (freqs, N, N), but got ndim={y_mag.ndim} and shape={y_mag.shape}."
+                            )
 
-                        if not isinstance(stamps, list):
-                            raise ComponentError(component_fqn=comp_fqn, details=f"MNA capability was expected to return a list of stamps, but returned type '{type(stamps).__name__}'.")
+                        if not (isinstance(y_qty.magnitude, np.ndarray) and y_qty.magnitude.ndim == 3):
+                            raise ComponentError(
+                               component_fqn=comp_fqn,
+                               details=(f"Stamp magnitude must be a 3D NumPy array (freqs, N, N), but got "
+                                        f"ndim={y_qty.magnitude.ndim} and shape={y_qty.magnitude.shape}.")
+                            )
+                        # --- END VALIDATION GATEWAY ---
                         
-                        for i, stamp_info in enumerate(stamps):
-                            if not (isinstance(stamp_info, tuple) and len(stamp_info) == 2):
-                                raise ComponentError(component_fqn=comp_fqn, details=f"Stamp at index {i} is not a valid 2-element tuple.")
-                            
-                            y_qty, _ = stamp_info
-                            if not isinstance(y_qty, Quantity):
-                                raise ComponentError(component_fqn=comp_fqn, details=f"Stamp value at index {i} is not a pint.Quantity object, but type '{type(y_qty).__name__}'.")
-                            
-                            if y_qty.dimensionality != ADMITTANCE_DIMENSIONALITY:
-                                raise ComponentError(
-                                    component_fqn=comp_fqn,
-                                    details=(
-                                        f"Stamp at index {i} has incorrect physical dimension. "
-                                        f"Expected [admittance], but got {y_qty.dimensionality}."
-                                    )
-                                ) from pint.DimensionalityError(y_qty.units, self.ureg.siemens)
-                        # --- END OF FIX ---
-                        
-                        all_stamps_vectorized[comp_fqn] = stamps
+                        all_stamps_vectorized[comp_fqn] = stamp_info
+
                     except Exception as e:
-                        if isinstance(e, ComponentError):
-                            raise
-                        raise ComponentError(component_fqn=comp_fqn, details=f"Failed during vectorized MNA stamp computation: {e}") from e
+                        if isinstance(e, ComponentError): raise
+                        raise ComponentError(
+                            component_fqn=comp_fqn,
+                            details=f"Failed during vectorized MNA stamp computation: {e}"
+                        ) from e
                 else:
                     logger.debug(f"Component '{comp_fqn}' does not provide IMnaContributor capability. Skipping.")
 
@@ -209,17 +260,10 @@ class SimulationEngine:
                         X = lu_II.solve(Y_IE.toarray())
                         y_matrices[idx] = Y_EE.toarray() - (Y_EI @ X)
                 except SingularMatrixError as e:
-                    # A singular matrix is a per-frequency numerical issue. Log it
-                    # and continue the sweep, leaving a `nan` in the result matrix. This is correct.
                     logger.error(f"[{circuit.hierarchical_id}] AC simulation failed at {freq_val_hz:.4e} Hz due to singular matrix: {e}")
                     continue
                 except (MnaInputError, ComponentError, ParameterError) as e:
-                    # These errors indicate a fundamental problem with the circuit definition
-                    # or a component plugin. They are not recoverable on a per-frequency basis.
-                    # Log the error and re-raise it to fail the entire simulation level immediately.
                     logger.error(f"[{circuit.hierarchical_id}] AC simulation failed at {freq_val_hz:.4e} Hz due to a fatal configuration error: {e}")
-                    # This 'raise' will be caught by the outer try/except of the _run_single_level_simulation
-                    # method, which will correctly wrap it in a SingleLevelSimulationFailure.
                     raise e
 
             return y_matrices, dc_analysis_results
@@ -233,8 +277,8 @@ class SimulationEngine:
 
     def _map_dc_y_to_ac_ports(self, dc_results: DCAnalysisResults, ac_port_names: List[str]) -> np.ndarray:
         """
-        MOVED from execution.py and REFINED to be fully decoupled from the DCAnalyzer instance.
-        This method now relies solely on the self-contained `DCAnalysisResults` object.
+        Maps the DC Y-matrix to the AC port ordering for F=0 simulation points.
+        This method relies solely on the self-contained `DCAnalysisResults` data contract.
         """
         num_ac_ports = len(ac_port_names)
         y_mapped = np.zeros((num_ac_ports, num_ac_ports), dtype=np.complex128)

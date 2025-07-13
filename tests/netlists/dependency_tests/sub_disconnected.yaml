@@ -1,0 +1,7 @@
+circuit_name: DisconnectedSub
+components:
+  - {id: R1, type: Resistor, ports: {p1: IN, p2: gnd}, parameters: {expression: "Quantity('50 ohm')", dimension: "ohm"}}
+  # Note: There is NO conductive path between port IN and port OUT
+ports:
+  - {id: IN, reference_impedance: "50 ohm"}
+  - {id: OUT, reference_impedance: "50 ohm"}

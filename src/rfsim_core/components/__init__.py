@@ -6,7 +6,7 @@ logger = logging.getLogger(__name__)
 from .base import (
     ComponentBase, COMPONENT_REGISTRY, register_component, DCBehaviorType
 )
-from .exceptions import ComponentError # ADD THIS LINE
+from .exceptions import ComponentError 
 # Import concrete elements to trigger registration
 from .elements import Resistor, Capacitor, Inductor
 

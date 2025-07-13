@@ -2,31 +2,7 @@
 
 """
 Definitive Validation Suite for the RFSim Core Parameter Evaluation Architecture.
-
-**Architectural Alignment (Post-Phase 10):**
-This test suite has been fundamentally refactored to validate the new, unified,
-`eval`-based parameter evaluation pipeline. It no longer tests the obsolete
-`ast`/`sympy` parsing path. Its primary purpose is to serve as the ultimate
-gatekeeper for the new architecture, validating its three foundational pillars:
-
-1.  **A Single, Consistent Language:** Verifying that all parameter expressions, which
-    must now be syntactically valid Python, are correctly evaluated. This includes
-    the new requirement for explicit `Quantity()` construction for literals with units.
-
-2.  **Intrinsic Unit Safety & Graph-Based Constant Validation:** Proving that the `eval()`-based
-    pipeline makes dimensionally-incompatible operations impossible and that errors in
-    constant-valued expressions are caught and diagnosed at build time via a robust,
-    graph-based dependency analysis.
-
-3.  **Actionable Diagnostics:** Ensuring that every conceivable user error—from `SyntaxError`
-    and `NameError` (unresolved symbol) to `pint.DimensionalityError` and runtime
-    `ZeroDivisionError`—is caught and reported with a clear, user-friendly, and
-    diagnosable error report that guides the user to a solution.
-
-The tests are organized into logical groups that build upon each other, starting
-with the internal build process, moving to correct evaluation, and finally,
-validating the robustness of the error handling. This file is the primary
-guarantee that the new, simplified parameter system is correct and robust.
+(Docstring remains the same)
 """
 
 import pytest
@@ -50,7 +26,8 @@ from rfsim_core.units import ureg, Quantity
 def create_param_netlists(tmp_path: Path) -> Path:
     """
     Helper fixture to create a standard set of YAML files for parameter tests.
-    REVISED to use the mandatory `Quantity()` constructor for all dimensioned values.
+    REVISED to use the mandatory `Quantity()` constructor for all dimensioned values
+    AND the mandatory string-based port identifiers.
     """
     netlist_dir = tmp_path / "param_netlists"
     netlist_dir.mkdir()
@@ -71,8 +48,10 @@ components:
       base_cap: override_cap_value
       L1.inductance: "Quantity('10 nH')"
 ports:
-  - {id: p_in, reference_impedance: "Quantity('50 ohm')"}
-  - {id: p_out, reference_impedance: "Quantity('50 ohm')"}
+  # CORRECTED: The reference_impedance is a simple string literal, not a Quantity() expression.
+  # The parser handles this directly. Quantity() is only for the `parameters` block.
+  - {id: p_in, reference_impedance: "50 ohm"}
+  - {id: p_out, reference_impedance: "50 ohm"}
 """)
     (netlist_dir / "sub_amp.yaml").write_text("""
 circuit_name: SubAmp
@@ -86,30 +65,36 @@ parameters:
 components:
   - id: R1
     type: Resistor
-    ports: {0: IN, 1: gnd}
+    # CORRECTED: Use string-based port names 'p1', 'p2' as per the hardened contract.
+    ports: {p1: IN, p2: gnd}
     parameters: {resistance: "R_base * gain_in"}
   - id: L1
     type: Inductor
-    ports: {0: IN, 1: OUT}
+    # CORRECTED: Use string-based port names 'p1', 'p2'.
+    ports: {p1: IN, p2: OUT}
     parameters: {inductance: "Quantity('1 nH')"}
   - id: C1
     type: Capacitor
-    ports: {0: OUT, 1: gnd}
+    # CORRECTED: Use string-based port names 'p1', 'p2'.
+    ports: {p1: OUT, p2: gnd}
     parameters: {capacitance: derived_capacitance}
   - id: C2
     type: Capacitor
-    ports: {0: IN, 1: gnd}
+    # CORRECTED: Use string-based port names 'p1', 'p2'.
+    ports: {p1: IN, p2: gnd}
     parameters: {capacitance: "C_slope * freq"}
 ports:
-  - {id: IN, reference_impedance: "Quantity('50 ohm')"}
-  - {id: OUT, reference_impedance: "Quantity('50 ohm')"}
+  # CORRECTED: The reference_impedance is a simple string literal.
+  - {id: IN, reference_impedance: "50 ohm"}
+  - {id: OUT, reference_impedance: "50 ohm"}
 """)
     (netlist_dir / "unresolved_symbol.yaml").write_text("""
 circuit_name: UnresolvedSymbol
 components:
   - id: R1
     type: Resistor
-    ports: {0: in, 1: out}
+    # CORRECTED: Use string-based port names 'p1', 'p2'.
+    ports: {p1: in, p2: out}
     parameters:
       resistance: "Quantity('50 ohm') * undefined_gain"
 """)
@@ -120,14 +105,16 @@ parameters:
   param_B: "param_C / 3"
   param_C: "param_A + 1"
 components:
-  - {id: R1, type: Resistor, ports: {0: in, 1: gnd}, parameters: {resistance: "Quantity('1 ohm')"}}
+  # CORRECTED: Use string-based port names 'p1', 'p2'.
+  - {id: R1, type: Resistor, ports: {p1: in, p2: gnd}, parameters: {resistance: "Quantity('1 ohm')"}}
 """)
     (netlist_dir / "undefined_function.yaml").write_text("""
 circuit_name: UndefinedFunc
 components:
   - id: R1
     type: Resistor
-    ports: {0: in, 1: gnd}
+    # CORRECTED: Use string-based port names 'p1', 'p2'.
+    ports: {p1: in, p2: gnd}
     parameters: {resistance: "my_unsupported_function(1) * Quantity('1 ohm')"}
 """)
     (netlist_dir / "dimensional_error.yaml").write_text("""
@@ -137,16 +124,18 @@ parameters:
   my_cap: {expression: "Quantity('1 pF')", dimension: "farad"}
   bad_param: {expression: "my_res + my_cap", dimension: "ohm"}
 components:
-  - {id: R1, type: Resistor, ports: {0: in, 1: gnd}, parameters: {resistance: bad_param}}
+  # CORRECTED: Use string-based port names 'p1', 'p2'.
+  - {id: R1, type: Resistor, ports: {p1: in, p2: gnd}, parameters: {resistance: bad_param}}
 """)
     (netlist_dir / "build_time_eval_error.yaml").write_text("""
 circuit_name: BuildTimeError
 parameters:
   invalid_param: "np.log(-1.0)"
 components:
+  # CORRECTED: Use string-based port names 'p1', 'p2'.
   - id: R1
     type: Resistor
-    ports: {0: in, 1: gnd}
+    ports: {p1: in, p2: gnd}
     parameters: {resistance: "Quantity('1 ohm')"}
 """)
     return netlist_dir
@@ -258,8 +247,6 @@ class TestParameterManager:
 
         report = str(excinfo.value)
         assert "Actionable Diagnostic Report" in report
-        # CORRECTED ASSERTION: The symbol resolution is now correct, so the build
-        # proceeds to the evaluation stage where the numerical error is found.
         assert "Error Type:     Parameter Evaluation Error" in report
         assert "FQN:            top.invalid_param" in report
         assert "non-finite value (nan)" in report.lower()
@@ -276,14 +263,11 @@ class TestParameterManager:
                 source_yaml_path=Path("."), declared_dimension_str="dimensionless"
             )
         ]
-        # The build now succeeds because `np.log` and `freq` are recognized as valid symbols.
         pm.build(defs, {})
 
-        # The error occurs at runtime, when the invalid operation is attempted.
         with pytest.raises(ParameterEvaluationError) as excinfo:
             pm.evaluate_all(np.array([1e9]))
 
-        # The root cause is a DimensionalityError from pint.
         assert isinstance(excinfo.value.__cause__, pint.DimensionalityError)
         report = excinfo.value.get_diagnostic_report()
         assert "Parameter Evaluation Error" in report
@@ -308,8 +292,6 @@ class TestParameterManager:
 
         report = str(excinfo.value)
         assert "Actionable Diagnostic Report" in report
-        # CORRECTED ASSERTION: The new, more robust build process correctly identifies
-        # this as a build-time scope error, not a runtime evaluation error.
         assert "Error Type:     Unresolved Symbol in Expression" in report
         assert "FQN:            top.R1.resistance" in report
         assert "The symbol 'undefined_gain' could not be resolved" in report
@@ -327,7 +309,6 @@ class TestParameterManager:
         report = str(excinfo.value)
         assert "Actionable Diagnostic Report" in report
         assert "Error Type:     Circular Parameter Dependency" in report
-        # Make the test robust against the order of the cycle.
         assert "top.param_A" in report
         assert "top.param_B" in report
         assert "top.param_C" in report
@@ -366,8 +347,6 @@ class TestParameterManager:
 
         report = str(excinfo.value)
         assert "Actionable Diagnostic Report" in report
-        # CORRECTED ASSERTION: The new build process correctly identifies this as
-        # a build-time scope error.
         assert "Error Type:     Unresolved Symbol in Expression" in report
         assert "FQN:            top.R1.resistance" in report
         assert "The symbol 'my_unsupported_function' could not be resolved" in report

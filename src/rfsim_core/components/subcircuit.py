@@ -2,36 +2,11 @@
 
 """
 Provides the concrete implementation for the hierarchical `SubcircuitInstance` component.
-
-**Architectural Refactoring (Definitive):**
-
-This module has been fully refactored and hardened to align with the project's definitive
-architectural mandates. The changes are as follows:
-
-1.  **Elimination of Fragile Asserts:** All `assert` statements used for runtime state
-    validation have been **REPLACED** with explicit `if/raise ComponentError` blocks. This
-    is a non-negotiable architectural requirement. It ensures that critical integrity checks
-    (e.g., verifying that a cache is populated) are not discardable by interpreter flags
-    (like `-O`) and that any failure generates a rich, actionable diagnostic report via
-    the `DiagnosableError` system, not a raw `AssertionError`.
-
-2.  **Cohesion of Implementation:** All logic related to a specific analysis domain
-    (e.g., MNA, DC) is encapsulated within a dedicated, stateless, nested class
-    inside its parent component class (e.g., `Resistor.MnaContributor`). This makes
-    the component's total functionality self-contained and highly discoverable.
-
-3.  **Declarative Registration:** The `@provides` decorator is used on these
-    nested classes to declaratively register them as implementers of a specific
-    capability protocol (e.g., `IMnaContributor`). This automates discovery and
-    improves the developer experience for plugin authors.
-
-4.  **Explicit Contracts:** The component now uses and relies on the formal, type-safe
-    `DCAnalysisResults` data contract for its DC cache, eliminating the use of fragile,
-    untyped dictionaries for this purpose.
 """
 
 import logging
-from typing import Dict, Any, List, Tuple, Optional, TYPE_CHECKING
+from typing import Dict, List, Tuple, Optional, TYPE_CHECKING
+import networkx as nx
 
 import numpy as np
 
@@ -39,26 +14,22 @@ import numpy as np
 from ..units import ureg, Quantity
 from ..parameters import ParameterManager
 from ..data_structures import Circuit
-from ..parser.raw_data import ParsedSubcircuitData
+from ..errors import FrameworkLogicError
 
-# --- Core Component Model Imports (Refactored) ---
-from .base import (
-    ComponentBase,
-    register_component,
-    StampInfo,
-)
+# --- Core Component Model Imports ---
+from .base import ComponentBase, register_component
 from .exceptions import ComponentError
 from .base_enums import DCBehaviorType
 
-# --- Capability System Imports (The Heart of the New Architecture) ---
-from .capabilities import IMnaContributor, IDcContributor, provides
+# --- Capability System Imports ---
+from .capabilities import IMnaContributor, IDcContributor, IConnectivityProvider, DcAdmittancePayload, provides
 
 # --- Type Imports for Explicit Contracts ---
-# Use TYPE_CHECKING to import DCAnalysisResults only for type analysis,
-# preventing a circular import at runtime with analysis.results.
+# Use TYPE_CHECKING to import result objects only for type analysis,
+# preventing circular imports at runtime.
 if TYPE_CHECKING:
-    # This import points to the new, formal result object in the 'analysis' package.
-    from ..analysis.results import DCAnalysisResults
+    from ..analysis.results import DCAnalysisResults, TopologyAnalysisResults
+    StampInfo = Tuple[Quantity, List[str]]
 
 
 logger = logging.getLogger(__name__)
@@ -68,39 +39,32 @@ logger = logging.getLogger(__name__)
 class SubcircuitInstance(ComponentBase):
     """
     Represents a hierarchical subcircuit instance within a larger circuit.
-    
+
     Acts as a proxy for a nested `Circuit` object, presenting pre-computed, cached
     results to the parent circuit's analysis engines via its capability implementations.
+    This component is a pure data proxy and holds no simulation logic itself.
     """
-
-    # --- Capability Implementations are Nested Here ---
 
     @provides(IMnaContributor)
     class MnaContributor:
         """
         Provides the pre-computed, cached MNA stamp for the subcircuit.
+        This capability trustingly assumes the simulation executive has populated the
+        `cached_y_parameters_ac` attribute on the component instance.
         """
-
         def get_mna_stamps(
             self,
             component: "SubcircuitInstance",
             freq_hz_array: np.ndarray,
-            # This argument is part of the IMnaContributor protocol signature
-            # but is intentionally ignored here because a SubcircuitInstance's
-            # behavior is fully determined by its pre-computed cache.
             all_evaluated_params: Dict[str, Quantity],
-        ) -> List[StampInfo]:
+        ) -> "StampInfo":
             """
-            Returns the N-port Y-matrix stamp from the pre-computed cache.
+            Returns the N-port Y-matrix stamp from the pre-computed cache as a single tuple.
             """
-            # --- MANDATORY REMEDIATION: Replace fragile asserts with robust, diagnosable checks. ---
             if component.cached_y_parameters_ac is None:
-                raise ComponentError(
-                    component_fqn=component.fqn,
-                    details=(
-                        "FATAL: AC Y-parameters cache was not populated before stamping. "
-                        "This indicates a critical failure in the simulation executive."
-                    )
+                raise FrameworkLogicError(
+                    f"Pre-condition failed: MNA stamping was requested for subcircuit "
+                    f"'{component.fqn}' before its AC simulation results were cached."
                 )
 
             num_freqs_cache, _, _ = component.cached_y_parameters_ac.shape
@@ -110,65 +74,86 @@ class SubcircuitInstance(ComponentBase):
                 raise ComponentError(
                     component_fqn=component.fqn,
                     details=(
-                        f"FATAL: Mismatched frequency count. Cache contains {num_freqs_cache} points, "
-                        f"but current sweep has {num_freqs_sweep} points. This indicates a critical "
-                        "failure in the simulation executive or caching logic."
+                        f"Mismatched frequency count. The cached data contains {num_freqs_cache} points, "
+                        f"but current sweep requires {num_freqs_sweep} points. This indicates a critical "
+                        "cache consistency failure in the simulation executive."
                     )
                 )
-            # --- END OF REMEDIATION ---
 
             admittance_matrix_qty = Quantity(
                 component.cached_y_parameters_ac, component.ureg.siemens
             )
-            return [(admittance_matrix_qty, component.sub_circuit_external_port_names_ordered)]
+            # MANDATED CHANGE: Return the tuple directly, not inside a list.
+            return (admittance_matrix_qty, component.sub_circuit_external_port_names_ordered)
 
     @provides(IDcContributor)
     class DcContributor:
         """
         Provides the pre-computed, cached DC behavior for the subcircuit.
+        This capability trustingly assumes the simulation executive has populated the
+        `cached_dc_analysis_results` attribute on the component instance.
         """
-
         def get_dc_behavior(
             self,
             component: "SubcircuitInstance",
-            # This argument is part of the IDcContributor protocol but is ignored here.
             all_dc_params: Dict[str, Quantity],
-        ) -> Tuple[DCBehaviorType, Optional[Quantity]]:
+        ) -> Tuple[DCBehaviorType, Optional[DcAdmittancePayload]]:
             """
             Returns the DC behavior of the subcircuit based on its cached results.
-
-            This method's behavior is determined entirely by its pre-computed DC analysis.
-            It will **NEVER** return `DCBehaviorType.SHORT_CIRCUIT`. A subcircuit that behaves
-            as a DC short across some or all of its ports is correctly and completely
-            represented by its N-port DC admittance matrix. Therefore, this method will
-            always return `DCBehaviorType.ADMITTANCE` when a valid DC Y-matrix is available.
-            This explicit contract is critical for the correctness of the `DCAnalyzer`.
-
-            The returned DC Y-matrix MAY BE SINGULAR. It is the explicit responsibility
-            of the consuming `DCAnalyzer` to handle this possibility robustly.
+            This implementation is now purified and component-agnostic.
             """
-            # --- MANDATORY REMEDIATION: Replace fragile assert with robust, diagnosable check. ---
             if component.cached_dc_analysis_results is None:
-                raise ComponentError(
-                    component_fqn=component.fqn,
-                    details=(
-                        "FATAL: DC analysis results cache was not populated before its DC behavior was requested. "
-                        "This indicates a critical failure in the simulation executive."
-                    )
+                raise FrameworkLogicError(
+                    f"Pre-condition failed: DC behavior was requested for subcircuit "
+                    f"'{component.fqn}' before its DC analysis results were cached."
                 )
-            # --- END OF REMEDIATION ---
 
-            # This uses the new, explicit dataclass contract.
             y_ports_dc_qty = component.cached_dc_analysis_results.y_ports_dc
 
-            if isinstance(y_ports_dc_qty, Quantity) and y_ports_dc_qty.check(
-                component.ureg.siemens
-            ):
-                return (DCBehaviorType.ADMITTANCE, y_ports_dc_qty)
+            if y_ports_dc_qty is not None:
+                port_order = component.cached_dc_analysis_results.dc_port_names_ordered
+                return (DCBehaviorType.ADMITTANCE, (y_ports_dc_qty, port_order))
+            else:
+                return (DCBehaviorType.OPEN_CIRCUIT, None)
 
-            return (DCBehaviorType.OPEN_CIRCUIT, None)
+    @provides(IConnectivityProvider)
+    class ConnectivityProvider:
+        """
+        Provides the subcircuit's effective external port-to-port connectivity.
+        This capability trustingly assumes the simulation executive has populated the
+        `cached_topology_results` attribute on the component instance.
+        """
+        def get_connectivity(self, component: "SubcircuitInstance") -> List[Tuple[str, str]]:
+            """
+            Provides the subcircuit's external port connectivity by reading it from
+            the cached, formal TopologyAnalysisResults object. This now includes
+            paths to the subcircuit's internal ground.
+            """
+            if component.cached_topology_results is None:
+                raise FrameworkLogicError(
+                    f"Pre-condition failed: Connectivity was requested for subcircuit "
+                    f"'{component.fqn}' before its topology results were cached. "
+                    "This indicates a logic error in the SimulationEngine's orchestration."
+                )
 
-    # --- Component's Own Declarations and __init__ Follow ---
+            # The formal result object is the explicit contract.
+            results = component.cached_topology_results
+            sub_ac_graph = results.ac_graph
+            sub_ground_name = component.sub_circuit_object.ground_net_name
+            sub_ext_ports = list(component.sub_circuit_object.external_ports.keys())
+            
+            # This is the connectivity reported by the sub-analysis
+            connectivity = results.external_port_connectivity
+
+            # NEW LOGIC: Check which external ports have a path to the subcircuit's internal ground
+            if sub_ground_name in sub_ac_graph:
+                for port in sub_ext_ports:
+                    if port in sub_ac_graph and nx.has_path(sub_ac_graph, port, sub_ground_name):
+                        # Use the subcircuit's ground name as a special token.
+                        # The parent's TopologyAnalyzer will know how to interpret this.
+                        connectivity.append((port, sub_ground_name))
+            
+            return connectivity
 
     def __init__(
         self,
@@ -177,31 +162,28 @@ class SubcircuitInstance(ComponentBase):
         sub_circuit_object_ref: Circuit,
         sub_circuit_external_port_names_ordered: List[str],
         parent_hierarchical_id: str,
-        raw_ir_data: ParsedSubcircuitData,
+        port_net_map: Dict[str, str],
+        raw_parameter_overrides: Dict,
     ):
         super().__init__(
             instance_id=instance_id,
+            component_type_str="Subcircuit",
             parameter_manager=parameter_manager,
             parent_hierarchical_id=parent_hierarchical_id,
-            raw_ir_data=raw_ir_data,
+            port_net_map=port_net_map,
         )
-
-        if not isinstance(raw_ir_data, ParsedSubcircuitData):
-            raise TypeError(
-                f"SubcircuitInstance '{instance_id}' must receive a "
-                "ParsedSubcircuitData object for its raw instance data."
-            )
 
         self.sub_circuit_object: Circuit = sub_circuit_object_ref
         self.sub_circuit_external_port_names_ordered: List[
             str
         ] = sub_circuit_external_port_names_ordered
 
+        # These attributes are populated by the simulation executive before being used
+        # by this component's capabilities. They are initialized to None.
         self.cached_y_parameters_ac: Optional[np.ndarray] = None
-        
-        # This attribute now holds a dedicated dataclass, not a raw dictionary,
-        # creating a robust, type-safe contract with the simulation executive.
         self.cached_dc_analysis_results: Optional["DCAnalysisResults"] = None
+        self.cached_topology_results: Optional["TopologyAnalysisResults"] = None
+        self.raw_parameter_overrides = raw_parameter_overrides
 
         logger.debug(
             f"SubcircuitInstance '{self.fqn}' initialized, referencing definition "
@@ -210,24 +192,14 @@ class SubcircuitInstance(ComponentBase):
 
     @classmethod
     def declare_parameters(cls) -> Dict[str, str]:
-        """Subcircuits do not declare parameters; they are containers."""
+        """Subcircuits do not declare parameters themselves; they are containers."""
         return {}
 
     @classmethod
-    def declare_ports(cls) -> List[str | int]:
-        """Subcircuit ports are dynamically defined by their definition file."""
-        return []
-
-    @classmethod
-    def declare_connectivity(cls) -> List[Tuple[str | int, str | int]]:
-        """Subcircuit connectivity is complex and handled by recursive analysis."""
-        return []
-
-    def is_structurally_open(
-        self, resolved_constant_params: Dict[str, Quantity]
-    ) -> bool:
+    def declare_ports(cls) -> List[str]:
         """
-        A subcircuit instance itself is never a simple structural open.
-        Its internal topology is handled by a recursive analysis.
+        Subcircuit ports are dynamically determined by its definition file and are not
+        declared statically on the component type itself. This method returns an
+        empty list to satisfy the abstract base class contract.
         """
-        return False
+        return []

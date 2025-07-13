@@ -112,7 +112,7 @@ class NetlistParser:
     _standard_component_schema = {
         "type": {"type": "string", "required": True, "id_regex": True, "forbidden": ["Subcircuit"]},
         "id": _id_rule,
-        "ports": {"type": "dict", "required": True, "minlength": 1, "keysrules": {"oneof": [{"type": "string", "id_regex": True}, {"type": "integer"}]}, "valuesrules": _net_name_rule},
+        "ports": {"type": "dict", "required": True, "minlength": 1, "keysrules": {"type": "string", "id_regex": True}, "valuesrules": _net_name_rule},
         "parameters": {"type": "dict", "required": False, "keysrules": _param_key_rule, "valuesrules": _param_value_schema},
     }
 

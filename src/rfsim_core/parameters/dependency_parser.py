@@ -74,7 +74,6 @@ class _DependencyVisitor(ast.NodeVisitor):
         ignored as a unit, and the visitor DESCENDS to find the child
         dependencies (e.g. `x` and `y`).
         """
-        # --- DEFINITIVE FIX: CORRECTED LOGIC FOR FLAW #2 ---
         full_chain = self._reconstruct_attribute_chain(node)
         if full_chain:
             # We successfully processed the entire chain as one dependency.
@@ -86,7 +85,6 @@ class _DependencyVisitor(ast.NodeVisitor):
             # We couldn't process it as a single unit, so we MUST
             # descend into its children to find the dependencies within.
             self.generic_visit(node)
-        # --- END OF FIX ---
 
 
 class ASTDependencyExtractor:

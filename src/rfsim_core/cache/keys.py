@@ -36,7 +36,7 @@ def create_subcircuit_sim_key(
 
     # 2. A canonical representation of the parameter overrides from the instance's YAML.
     # Sorting ensures that the key is identical regardless of the order in the YAML file.
-    overrides = sub_inst.raw_ir_data.raw_parameter_overrides
+    overrides = sub_inst.raw_parameter_overrides
     canonical_overrides = tuple(sorted(
         (k, str(sorted(v.items()) if isinstance(v, dict) else v))
         for k, v in overrides.items()

@@ -3,14 +3,6 @@
 """
 Manages all circuit parameters, their dependencies, and their evaluation with
 rigorous, dimensionally-aware arithmetic.
-
-**Architectural Revision (Post-Phase 10):**
-This module has been significantly hardened to enforce the "Correctness by Construction"
-and "Actionable Diagnostics" mandates. The `ParameterManager.build()` method now
-executes a rigorous, multi-stage validation pipeline that ensures all parameter
-expressions are syntactically and semantically valid *before* any numerical
-evaluation is attempted. This catches errors at the earliest possible stage and
-provides superior diagnostic reports.
 """
 
 import logging
@@ -62,7 +54,11 @@ class _ExpressionEvaluator:
         "Quantity": Quantity,
         "np": np,
         "pi": np.pi,
-        #"__builtins__": {"abs": abs, "min": min, "max": max} # A minimal, safe set
+        "complex": complex,
+        "abs": abs,
+        "min": min,
+        "max": max,
+        #"__builtins__": {}
     }
 
     class _AstTransformer(ast.NodeTransformer):
@@ -282,8 +278,6 @@ class ParameterManager:
 
     def _validate_and_build_dependency_graph(self) -> Set[str]:
         """
-        DEFINITIVE FIX: The definitive build-time validation and dependency analysis pipeline.
-
         This method iterates through ALL parameter definitions and performs rigorous checks:
         1.  Validates that the expression is syntactically correct Python.
         2.  Extracts all dependencies from the expression's AST.
